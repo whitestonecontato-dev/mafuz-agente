@@ -1,8 +1,8 @@
-# CONHECIMENTO DA CASA — MAFUZ
+# CONHECIMENTO DA CASA: MAFUZ
 
 Este arquivo é lido pelo agente a cada conversa. A equipe pode editar o texto
 (sem mexer em código) e fazer um novo deploy. Escreva só o que for verdade e
-estiver confirmado — o agente trata tudo aqui como fato.
+estiver confirmado: o agente trata tudo aqui como fato. Não use travessões.
 
 ## Quem somos
 - MAFUZ Imóveis de Luxo · CRECI MG 7035 · razão social Vila da Serra Imóveis Ltda.
@@ -12,9 +12,9 @@ estiver confirmado — o agente trata tudo aqui como fato.
 - Mais de 340 contratos assinados e mais de R$ 300 milhões em vendas.
 
 ## Unidades
-- Vila da Serra (sede) — R. Min. Orozimbo Nonato, 102, Sala 1101 B, Vila da Serra, Nova Lima/MG. Telefone (31) 98727-7000.
-- Alphaville — Av. Picalilly, 100, Loja 109, Alphaville, Nova Lima/MG. Telefone (31) 98204-6770.
-- Lagoa Santa — R. das Framboesas, 182, Vila Jardim Presidente, Lagoa Santa/MG. Telefone (31) 98565-9383.
+- Vila da Serra (sede): R. Min. Orozimbo Nonato, 102, Sala 1101 B, Vila da Serra, Nova Lima/MG. Telefone (31) 98727-7000.
+- Alphaville: Av. Picalilly, 100, Loja 109, Alphaville, Nova Lima/MG. Telefone (31) 98204-6770.
+- Lagoa Santa: R. das Framboesas, 182, Vila Jardim Presidente, Lagoa Santa/MG. Telefone (31) 98565-9383.
 
 ## O que a casa faz
 - Venda de imóveis residenciais de alto padrão: apartamentos, casas em condomínio, coberturas e lotes.
@@ -37,7 +37,7 @@ estiver confirmado — o agente trata tudo aqui como fato.
   (motivo "busca_dedicada").
 
 ## Site
-- mafuz.com.br — cada imóvel tem uma ficha com fotos, descrição e o Mafuz Index (MFI),
+- mafuz.com.br: cada imóvel tem uma ficha com fotos, descrição e o Mafuz Index (MFI),
   uma nota de 0 a 100 que avalia documentação, localização, estrutura, amenidades,
   qualidade das fotos e competitividade de preço.
 

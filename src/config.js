@@ -75,11 +75,22 @@ const config = {
     anthropicBaseUrl: env('ANTHROPIC_BASE_URL', 'https://api.anthropic.com').replace(/\/$/, ''),
     openaiKey: env('OPENAI_API_KEY'),
     openaiModelo: env('OPENAI_MODEL', 'gpt-5.4-mini'),
-    openaiEsforco: env('OPENAI_REASONING_EFFORT', 'low'),
+    openaiEsforco: env('OPENAI_REASONING_EFFORT', ''), // gpt-5.4-mini não aceita reasoning_effort junto com ferramentas no Chat Completions
     anthropicKey: env('ANTHROPIC_API_KEY'),
     anthropicModelo: env('ANTHROPIC_MODEL', 'claude-sonnet-5'),
     maxTokens: +env('LLM_MAX_TOKENS', '900'),
     timeoutMs: +env('LLM_TIMEOUT_MS', '45000'),
+  },
+
+  agente: {
+    // Como a assistente se apresenta ao cliente.
+    nome: env('AGENTE_NOME', 'Gabi'),
+    empresa: env('EMPRESA_NOME', 'Mafuz Imóveis de Luxo'),
+  },
+
+  catalogo: {
+    // A base inteira do Imoview é recarregada a cada N minutos.
+    sincronizarACadaMin: +env('CATALOGO_SYNC_MIN', '60'),
   },
 
   equipe: {
@@ -97,7 +108,7 @@ const config = {
     modo: env('MODO_OPERACAO', '24h'),
     horarioTexto: env('HORARIO_COMERCIAL', '1-5 09:00-18:00; 6 09:00-13:00'),
     horarioVisitasTexto: env('HORARIO_VISITAS', '1-5 09:00-18:00; 6 09:00-13:00'),
-    debounceMs: +env('DEBOUNCE_MS', '5000'),
+    debounceMs: +env('DEBOUNCE_MS', '4000'),
     pausaHumanoHoras: +env('PAUSA_HUMANO_HORAS', '12'),
     maxTurnosSemAvanco: +env('MAX_TURNOS', '12'),
     conversaTtlDias: +env('CONVERSA_TTL_DIAS', '7'),

@@ -14,6 +14,32 @@ class SiteLinks {
     this.cache = new Map();
   }
 
+  // Carrega de uma vez o mapa código do Imoview -> página do site (usado na sincronização do catálogo).
+  async carregarTodos() {
+    if (!this.cfg.supabaseUrl || !this.cfg.supabaseAnonKey) return 0;
+    const agora = Date.now();
+    let total = 0;
+    for (let offset = 0; offset < 20000; offset += 1000) {
+      const url = `${this.cfg.supabaseUrl}/rest/v1/properties?select=id,external_id&status=eq.published&external_id=not.is.null&order=id&limit=1000&offset=${offset}`;
+      const r = await fetch(url, {
+        headers: { apikey: this.cfg.supabaseAnonKey, Authorization: `Bearer ${this.cfg.supabaseAnonKey}` },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!r.ok) throw new Error(`site HTTP ${r.status}`);
+      const linhas = await r.json();
+      for (const row of linhas) this.cache.set(String(row.external_id), { url: `${this.cfg.url}/imovel/${row.id}`, ts: agora });
+      total += linhas.length;
+      if (linhas.length < 1000) break;
+    }
+    return total;
+  }
+
+  // Leitura instantânea (sem rede) para o catálogo local.
+  linkLocal(codigo) {
+    const hit = this.cache.get(String(codigo));
+    return hit ? { url: hit.url, pagina: true } : { url: this.fallback(codigo), pagina: false };
+  }
+
   fallback(codigo) {
     return `${this.cfg.url}/imoveis?q=${encodeURIComponent(codigo)}`;
   }

@@ -1,5 +1,5 @@
 'use strict';
-// Mafuz IA — servidor do agente de WhatsApp.
+// Servidor da assistente de WhatsApp da Mafuz (Gabi).
 // Z-API (webhook) -> fila com agrupamento de mensagens -> agente (LLM + Imoview) -> Z-API.
 
 const http = require('http');
@@ -10,6 +10,7 @@ const { SiteLinks } = require('./site');
 const { Imoview } = require('./imoview');
 const { LLM } = require('./llm');
 const { Agente } = require('./agent');
+const { Catalogo } = require('./catalogo');
 const { log, digitos, dentroDoHorario, foneExibicao, sleep } = require('./util');
 
 const VERSAO = '1.0.0';
@@ -20,7 +21,24 @@ const zapi = new ZApi(config.zapi);
 const site = new SiteLinks(config.site);
 const imoview = new Imoview(config.imoview, site, config.comportamento.limiteAltoTicket);
 const llm = new LLM({ ...config.llm, modeloTranscricao: config.comportamento.modeloTranscricao });
-const agente = new Agente({ config, store, zapi, imoview, llm });
+const catalogo = new Catalogo({ imoview, site, config });
+const agente = new Agente({ config, store, zapi, imoview, llm, catalogo });
+
+// Rastro dos últimos webhooks recebidos e do que foi decidido com cada um (diagnóstico em /admin/estado).
+const rastro = [];
+function rastrear(p, decisao, extra = {}) {
+  rastro.push({
+    ts: new Date().toISOString(),
+    fone: p && p.phone ? String(p.phone).slice(-6) : '',
+    tipo: p && p.type,
+    fromMe: !!(p && p.fromMe),
+    fromApi: !!(p && p.fromApi),
+    texto: p && p.text && p.text.message ? String(p.text.message).slice(0, 30) : '',
+    decisao,
+    ...extra,
+  });
+  if (rastro.length > 200) rastro.splice(0, rastro.length - 200);
+}
 
 // ---------------- telefones ----------------
 // Compara números brasileiros ignorando 55 e o 9º dígito (o WhatsApp às vezes omite).
@@ -32,6 +50,9 @@ function chaveFone(f) {
 const mesmoFone = (a, b) => chaveFone(a) === chaveFone(b);
 const internos = () => [...config.equipe.admins, ...config.equipe.alertas];
 const ehInterno = (fone) => internos().some((x) => mesmoFone(x, fone));
+// Modo teste: um número da equipe passa a conversar com o agente como se fosse cliente
+// (comandos com # continuam funcionando). Ligado/desligado por #teste.
+const emModoTeste = (fone) => !!(store.global.testers && store.global.testers[chaveFone(fone)]);
 
 function botAtivo() {
   return store.global.botAtivo === null || store.global.botAtivo === undefined ? config.comportamento.botAtivo : store.global.botAtivo;
@@ -94,7 +115,7 @@ async function montarTexto(itens, conv) {
           log('transcricao_erro', { erro: e.message });
         }
       }
-      partes.push(transcrito ? `[áudio] ${transcrito}` : '[o cliente enviou um áudio que não pôde ser transcrito — peça com gentileza que escreva]');
+      partes.push(transcrito ? `[áudio] ${transcrito}` : '[o cliente enviou um áudio que não pôde ser transcrito; peça com gentileza que escreva]');
     } else if (it.midia && !it.texto) {
       partes.push(`[o cliente enviou ${it.midia} sem texto]`);
     } else if (it.texto) {
@@ -121,7 +142,7 @@ async function detectarOrigem(conv, texto) {
   try {
     const ficha = await imoview.detalhar(m[1]);
     if (ficha) {
-      conv.origem = { codigo: ficha.codigo, titulo: `${ficha.tipo} no ${ficha.bairro} — ${ficha.preco_formatado}`, url: ficha.url };
+      conv.origem = { codigo: ficha.codigo, titulo: `${ficha.tipo}, ${ficha.bairro}, ${ficha.preco_formatado}`, url: ficha.url };
       agente.registrarImoveis(conv, [ficha]);
       conv.qualificacao.codigo_imovel_interesse = conv.qualificacao.codigo_imovel_interesse || ficha.codigo;
       if (ficha.finalidade) conv.qualificacao.finalidade = conv.qualificacao.finalidade || (/loca/i.test(ficha.finalidade) ? 'alugar' : 'comprar');
@@ -162,41 +183,49 @@ async function atender(fone, itens) {
     limiteTurnos: conv.turnosSemAvanco >= config.comportamento.maxTurnosSemAvanco,
   };
 
-  // Falha do modelo: mensagem neutra de espera e nova tentativa; na segunda falha, escala.
+  // Falha do modelo: tenta de novo em silêncio; se falhar outra vez, avisa o cliente com gentileza,
+  // alerta a equipe e segue disponível (o agente nunca fica mudo por conta de um erro).
   let resposta;
-  try {
-    resposta = await agente.responder(conv, texto, sinais);
-  } catch (e) {
-    log('llm_erro', { fone: mascarar(fone), erro: e.message });
-    const aviso = 'Só um instante, estou verificando isso para você.';
-    await enviarResposta(fone, aviso).catch(() => {});
-    await sleep(4000);
+  for (let tentativa = 1; tentativa <= 3 && !resposta; tentativa++) {
     try {
       resposta = await agente.responder(conv, texto, sinais);
-    } catch (e2) {
-      log('llm_erro_2', { fone: mascarar(fone), erro: e2.message });
+    } catch (e) {
+      log('llm_erro', { fone: mascarar(fone), tentativa, erro: e.message });
+      if (tentativa < 3) await sleep(2500 * tentativa);
     }
   }
   store.adicionarHistorico(conv, 'cliente', texto);
 
   if (!resposta) {
-    await agente
-      .executar('transferir_humano', { motivo: 'falha_tecnica', urgencia: 'alta', resumo: `Falha ao gerar resposta. Última mensagem: "${texto.slice(0, 300)}"` }, conv, {})
-      .catch(() => {});
-    const msg = `Vou pedir para ${config.equipe.nomeTransferencia} continuar seu atendimento por aqui. Em instantes alguém da equipe fala com você.`;
+    const msg = 'Me dá só um minutinho, estou confirmando isso para você e já te respondo por aqui.';
     await enviarResposta(fone, msg).catch(() => {});
     store.adicionarHistorico(conv, 'agente', msg);
+    await agente
+      .alertarEquipe(`⚠️ FALHA TÉCNICA: a ${config.agente.nome} não conseguiu responder agora.\nCliente: ${conv.nome || 'sem nome'} · ${foneExibicao(fone)}\nhttps://wa.me/${fone}\nÚltima mensagem: "${texto.slice(0, 300)}"\nSe puder, responda o cliente pelo WhatsApp da Mafuz.`)
+      .catch(() => {});
     return;
   }
 
-  // Se alguém da equipe assumiu enquanto o modelo pensava, não envia.
+  const enviarAlertas = async () => {
+    for (const montar of resposta.turno.alertas || []) {
+      try {
+        await agente.alertarEquipe(montar());
+      } catch (e) {
+        log('alerta_erro', { erro: e.message });
+      }
+    }
+  };
+
+  // Se alguém da equipe assumiu enquanto o modelo pensava, não envia ao cliente.
   if (store.pausado(fone) && !resposta.turno.transferiu) {
     log('resposta_descartada_humano_assumiu', { fone: mascarar(fone) });
-    return;
+    return enviarAlertas();
   }
-  if (!resposta.texto) return;
-  store.adicionarHistorico(conv, 'agente', resposta.texto);
-  await enviarResposta(fone, resposta.texto);
+  if (resposta.texto) {
+    store.adicionarHistorico(conv, 'agente', resposta.texto);
+    await enviarResposta(fone, resposta.texto);
+  }
+  await enviarAlertas();
   store.evento('resposta', { fone, ferramentas: resposta.turno.ferramentas });
 }
 
@@ -213,7 +242,8 @@ async function comando(fone, texto) {
       const leadsHoje = Object.values(store.leads).filter((l) => Date.parse(l.atualizadoEm) > dia).length;
       const visitas = store.visitas.filter((v) => v.status === 'aguardando_confirmacao').length;
       r = [
-        `Mafuz IA ${botAtivo() ? 'LIGADA' : 'DESLIGADA'} · modo ${config.comportamento.modo}`,
+        `${config.agente.nome} ${botAtivo() ? 'LIGADA' : 'DESLIGADA'} · modo ${config.comportamento.modo}${emModoTeste(fone) ? ' · você está em MODO TESTE' : ''}`,
+        `Carteira carregada: ${catalogo.itens.length} imóveis`,
         `Conversas nas últimas 24h: ${ativas}`,
         `Leads atualizados nas últimas 24h: ${leadsHoje}`,
         `Pedidos de visita registrados: ${visitas}`,
@@ -240,6 +270,27 @@ async function comando(fone, texto) {
       }
       break;
     }
+    case '#teste': {
+      store.global.testers = store.global.testers || {};
+      const chave = chaveFone(fone);
+      const ligar = /off|desliga|sair|parar/i.test(arg) ? false : /on|liga/i.test(arg) ? true : !store.global.testers[chave];
+      if (ligar) store.global.testers[chave] = true;
+      else delete store.global.testers[chave];
+      store.tocar();
+      r = ligar
+        ? `Modo teste LIGADO: a partir de agora você conversa com a ${config.agente.nome} como se fosse um cliente (os alertas também chegam aqui). Para recomeçar do zero: #reset. Para sair: #teste off`
+        : 'Modo teste DESLIGADO: este número volta a ser só da equipe (alertas e comandos).';
+      break;
+    }
+    case '#reset': {
+      const alvo = arg ? acharConversa(arg) : Object.keys(store.conversas).find((k) => mesmoFone(k, fone)) || fone;
+      delete store.conversas[alvo];
+      delete store.leads[alvo];
+      store.visitas = store.visitas.filter((v) => !mesmoFone(v.fone, alvo));
+      store.tocar();
+      r = `Conversa de ${foneExibicao(alvo)} apagada. A próxima mensagem começa um atendimento novo.`;
+      break;
+    }
     case '#desligar':
       store.global.botAtivo = false;
       store.tocar();
@@ -260,7 +311,7 @@ async function comando(fone, texto) {
       break;
     }
     default:
-      r = 'Comandos: #status · #leads · #pausar <número> · #retomar <número> · #desligar · #ligar';
+      r = 'Comandos: #status · #leads · #pausar <número> · #retomar <número> · #desligar · #ligar · #teste (conversar com o agente como cliente) · #reset (apagar sua conversa de teste)';
   }
   agente.marcarEnviado(fone, r);
   await zapi.enviarTexto(fone, r).catch((e) => log('comando_erro', { erro: e.message }));
@@ -270,12 +321,13 @@ async function comando(fone, texto) {
 // ---------------- webhook Z-API ----------------
 async function processarWebhook(p) {
   if (!p || typeof p !== 'object') return;
-  if (p.type && p.type !== 'ReceivedCallback') return;
-  if (p.isGroup || p.isNewsletter || p.broadcast || p.isStatusReply || p.isEdit) return;
-  if (p.reaction || p.notification) return;
+  if (p.type && p.type !== 'ReceivedCallback') return; // status, presença etc.
+  if (p.isGroup || p.isNewsletter || p.broadcast || p.isStatusReply) return rastrear(p, 'ignorado: grupo/canal/status');
+  if (p.isEdit) return rastrear(p, 'ignorado: mensagem editada');
+  if (p.reaction || p.notification) return rastrear(p, 'ignorado: reação/notificação');
   const fone = digitos(p.phone);
-  if (!fone || fone.length < 10) return;
-  if (store.jaProcessado(p.messageId)) return;
+  if (!fone || fone.length < 10) return rastrear(p, 'ignorado: telefone inválido');
+  if (store.jaProcessado(p.messageId)) return rastrear(p, 'ignorado: repetida');
 
   const texto = (
     (p.text && p.text.message) ||
@@ -288,11 +340,11 @@ async function processarWebhook(p) {
     ''
   ).trim();
 
-  // Mensagem que saiu do próprio número da MAFUZ.
+  // Mensagem que saiu do próprio número da Mafuz.
   if (p.fromMe) {
-    if (p.fromApi || agente.foiEnviadoPorNos(fone, texto)) return; // enviada pelo assistente
-    if (ehInterno(fone)) return;
-    // Alguém da equipe respondeu pelo celular / WhatsApp Web: o assistente se cala nesta conversa.
+    if (p.fromApi || agente.foiEnviadoPorNos(fone, texto)) return rastrear(p, 'enviada pela assistente');
+    if (ehInterno(fone)) return rastrear(p, 'enviada para a equipe');
+    // Alguém da equipe respondeu pelo celular / WhatsApp Web: a assistente se cala nesta conversa.
     store.pausar(fone, config.comportamento.pausaHumanoHoras, 'humano_assumiu');
     const f = filas.get(fone);
     if (f) {
@@ -301,12 +353,15 @@ async function processarWebhook(p) {
     }
     log('humano_assumiu', { fone: mascarar(fone) });
     store.evento('humano_assumiu', { fone });
-    return;
+    return rastrear(p, 'corretor assumiu: assistente em silêncio');
   }
 
   if (ehInterno(fone)) {
-    if (texto.startsWith('#')) await comando(fone, texto);
-    return;
+    if (texto.startsWith('#')) {
+      rastrear(p, 'comando da equipe');
+      return comando(fone, texto);
+    }
+    if (!emModoTeste(fone)) return rastrear(p, 'ignorado: número da equipe (use #teste para conversar)');
   }
 
   const item = { texto, nome: p.senderName || p.chatName || '', ts: p.momment || Date.now() };
@@ -318,19 +373,34 @@ async function processarWebhook(p) {
     else if (p.sticker) item.midia = 'uma figurinha';
     else if (p.location) item.midia = 'uma localização';
     else if (p.contact) item.midia = 'um contato';
-    else return;
+    else return rastrear(p, p.waitingMessage ? 'ignorado: WhatsApp ainda aguardando a mensagem' : 'ignorado: sem texto');
   }
 
-  if (!botAtivo()) return log('ignorado_bot_desligado', { fone: mascarar(fone) });
+  if (!botAtivo()) return rastrear(p, 'ignorado: assistente desligada');
   if (config.comportamento.modo === 'fora_do_horario' && dentroDoHorario(config.comportamento.horario)) {
-    return log('ignorado_horario_comercial', { fone: mascarar(fone) });
+    return rastrear(p, 'ignorado: horário comercial');
   }
   if (store.pausado(fone)) {
     const conv = store.conversa(fone);
     if (item.texto) store.adicionarHistorico(conv, 'cliente', item.texto);
-    return log('ignorado_humano_atendendo', { fone: mascarar(fone) });
+    return rastrear(p, 'ignorado: corretor atendendo');
   }
+  rastrear(p, 'na fila para responder');
   enfileirar(fone, item);
+}
+
+// Situação da conexão do WhatsApp na Z-API (consultada no máximo a cada 60 s).
+let statusWhats = { valor: 'não verificado', ts: 0 };
+async function situacaoWhatsApp() {
+  if (Date.now() - statusWhats.ts < 60000) return statusWhats.valor;
+  try {
+    const st = await zapi.status();
+    statusWhats = { valor: st && st.connected && st.smartphoneConnected !== false ? 'conectado' : 'DESCONECTADO: reconecte pelo QR Code na Z-API', ts: Date.now() };
+  } catch (e) {
+    statusWhats = { valor: `erro ao consultar a Z-API: ${e.message.slice(0, 120)}`, ts: Date.now() };
+  }
+  if (!/^conectado/.test(statusWhats.valor)) log('whatsapp_desconectado', { situacao: statusWhats.valor });
+  return statusWhats.valor;
 }
 
 // ---------------- HTTP ----------------
@@ -369,7 +439,9 @@ const servidor = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
       return responderJson(res, 200, {
         ok: true,
-        servico: 'Mafuz IA — agente WhatsApp',
+        servico: `${config.agente.nome} (${config.agente.empresa}): agente WhatsApp`,
+        carteira: catalogo.itens.length,
+        whatsapp: await situacaoWhatsApp(),
         versao: VERSAO,
         assistente: botAtivo() ? 'ligado' : 'desligado',
         modo: config.comportamento.modo,
@@ -429,6 +501,32 @@ const servidor = http.createServer(async (req, res) => {
         return responderJson(res, 200, out);
       }
 
+      // Conversa de teste com o modelo real, sem enviar nada pelo WhatsApp e sem alertar a equipe.
+      // Ex.: /admin/simular?token=...&conversa=1&texto=oi   (&reset=1 apaga a conversa de teste)
+      if (url.pathname === '/admin/simular') {
+        const chave = 'simulacao-' + String(url.searchParams.get('conversa') || '1').replace(/\W/g, '').slice(0, 20);
+        if (url.searchParams.get('reset')) delete store.conversas[chave];
+        const texto = String(url.searchParams.get('texto') || '').trim();
+        if (!texto) return responderJson(res, 200, { ok: true, conversa: chave, apagada: !!url.searchParams.get('reset') });
+        const conv = store.conversa(chave);
+        if (!conv.nome) conv.nome = String(url.searchParams.get('nome') || 'Cliente Teste');
+        await detectarOrigem(conv, texto);
+        const sinais = { primeiraMensagem: conv.historico.length === 0, negociacao: agente.detectarNegociacao(texto), simulacao: true };
+        const t0 = Date.now();
+        const r = await agente.responder(conv, texto, sinais);
+        store.adicionarHistorico(conv, 'cliente', texto);
+        store.adicionarHistorico(conv, 'agente', r.texto);
+        delete store.leads[chave];
+        store.visitas = store.visitas.filter((v) => v.fone !== chave);
+        return responderJson(res, 200, {
+          conversa: chave,
+          segundos: Math.round((Date.now() - t0) / 100) / 10,
+          mensagens: r.texto.split(/\n\s*\n/).map((m) => m.trim()).filter(Boolean),
+          ferramentas: r.turno.ferramentas,
+          alertas_para_equipe: (r.turno.alertas || []).map((f) => f()),
+        });
+      }
+
       if (url.pathname === '/admin/leads.csv') {
         const linhas = [['atualizado_em', 'nome', 'telefone', 'temperatura', 'finalidade', 'tipo', 'cidade', 'bairros', 'preco_min', 'preco_max', 'quartos', 'prazo', 'pagamento', 'imovel_interesse', 'observacoes']];
         for (const l of Object.values(store.leads)) {
@@ -447,6 +545,15 @@ const servidor = http.createServer(async (req, res) => {
 
       if (url.pathname === '/admin/estado') {
         return responderJson(res, 200, {
+          config: {
+            assistente: config.agente.nome,
+            site: config.site.url,
+            modelo: config.llm.provedor === 'openai' ? config.llm.openaiModelo : config.llm.anthropicModelo,
+            numeros_equipe: config.equipe.alertas.map((n) => '••' + n.slice(-4)),
+            em_modo_teste: Object.keys(store.global.testers || {}).map((n) => '••' + n.slice(-4)),
+          },
+          catalogo: catalogo.status(),
+          webhooks_recentes: rastro.slice(-40),
           assistente: botAtivo() ? 'ligado' : 'desligado',
           conversas: Object.values(store.conversas)
             .sort((a, b) => b.atualizadaEm - a.atualizadaEm)
@@ -478,7 +585,10 @@ function iniciar() {
   servidor.listen(config.porta, () => {
     log('servidor_no_ar', { porta: config.porta, versao: VERSAO, modo: config.comportamento.modo, llm: config.llm.provedor });
   });
-  if (config.imoview.chave) imoview.garantirListas().catch(() => {});
+  if (config.imoview.chave) {
+    imoview.garantirListas().catch(() => {});
+    catalogo.iniciar(config.catalogo.sincronizarACadaMin);
+  }
   const encerrar = () => {
     store.salvar(true);
     process.exit(0);
@@ -489,4 +599,4 @@ function iniciar() {
 
 if (require.main === module) iniciar();
 
-module.exports = { servidor, processarWebhook, store, agente, imoview, filas, iniciar, chaveFone };
+module.exports = { servidor, processarWebhook, store, agente, imoview, catalogo, filas, iniciar, chaveFone, rastro };

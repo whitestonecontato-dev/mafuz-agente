@@ -16,7 +16,7 @@ const FERRAMENTAS = [
   {
     name: 'buscar_imoveis',
     description:
-      'Busca imóveis REAIS e disponíveis no estoque da MAFUZ (Imoview), ao vivo. Use sempre que o cliente descrever o que procura ou pedir outro recorte. Retorna até 5 imóveis com código, dados e link do site; apresente no máximo 3.',
+      'Busca na carteira INTEIRA da Mafuz (todos os imóveis do Imoview, à venda e para alugar), lendo inclusive a descrição de cada anúncio. Use sempre que o cliente disser o que procura ou pedir outro recorte. Coloque os desejos do cliente em texto_livre. Retorna até 5 imóveis com resumo, o que atende ao pedido, destaques, oportunidade e link; apresente no máximo 3.',
     parameters: {
       type: 'object',
       properties: {
@@ -32,6 +32,7 @@ const FERRAMENTAS = [
         area_min: { type: 'number', description: 'Área mínima em m²' },
         texto_livre: { type: 'string', description: 'Desejos qualitativos: "piscina", "vista para a serra", "aceita pet", "varanda gourmet"' },
         codigo: { type: 'string', description: 'Código do imóvel, quando o cliente citar um código' },
+        ordenar: { type: 'string', enum: ['relevancia', 'menor_preco', 'maior_preco', 'maior_area'], description: 'Padrão: relevância para o pedido e melhores oportunidades' },
         limite: { type: 'integer', description: 'Máximo de resultados (até 5)' },
       },
     },
@@ -97,6 +98,7 @@ const FERRAMENTAS = [
         motivo: {
           type: 'string',
           enum: [
+            'qualificado',
             'pedido_do_cliente',
             'negociacao',
             'juridico',
@@ -123,6 +125,7 @@ const RE_NEGOCIACAO =
   /\b(desconto|contra-?proposta|proposta|negoci\w*|abaix\w+ (o )?(valor|pre[cç]o)|fech[ao]\w* por|aceita\w* \d|pago \d|pagar \d|ofere[cç]o \d|oferta de \d|melhor pre[cç]o|valor final)\b/i;
 
 const MOTIVO_LEGIVEL = {
+  qualificado: 'lead qualificado, visita reservada',
   pedido_do_cliente: 'cliente pediu atendimento humano',
   negociacao: 'negociação de valor',
   juridico: 'assunto jurídico/documentação',
@@ -140,8 +143,9 @@ const MOTIVO_LEGIVEL = {
 const ORDEM_TEMP = { C: 1, B: 2, A: 3 };
 
 class Agente {
-  constructor({ config, store, zapi, imoview, llm }) {
+  constructor({ config, store, zapi, imoview, llm, catalogo }) {
     this.config = config;
+    this.catalogo = catalogo || null;
     this.store = store;
     this.zapi = zapi;
     this.imoview = imoview;
@@ -164,6 +168,13 @@ class Agente {
       }
     }
     if (!this.config.equipe.alertas.length) log('alerta_sem_destino', { texto: texto.slice(0, 200) });
+  }
+
+  // Alertas saem DEPOIS da resposta ao cliente (e com os imóveis já marcados como apresentados).
+  // Sem turno (ex.: falha técnica), sai na hora.
+  async alertar(turno, montarTexto) {
+    if (turno && Array.isArray(turno.alertas)) turno.alertas.push(montarTexto);
+    else await this.alertarEquipe(montarTexto());
   }
 
   marcarEnviado(fone, texto) {
@@ -259,7 +270,7 @@ class Agente {
     args = args || {};
     switch (nome) {
       case 'buscar_imoveis': {
-        const r = await this.imoview.buscar(args);
+        const r = this.catalogo && this.catalogo.pronto() ? await this.catalogo.buscar(args) : await this.imoview.buscar(args);
         this.registrarImoveis(conv, r.imoveis);
         const q = conv.qualificacao;
         if (args.finalidade) q.finalidade = q.finalidade || (args.finalidade === 'locacao' ? 'alugar' : 'comprar');
@@ -311,15 +322,15 @@ class Agente {
 
         const subiu = temp && (!tempAnterior || ORDEM_TEMP[temp] > ORDEM_TEMP[tempAnterior]);
         if (!anterior || subiu) {
-          const titulo = !anterior ? '🟢 NOVO LEAD — Mafuz IA' : `🔥 LEAD ESQUENTOU (${tempAnterior || '-'} → ${temp})`;
+          const titulo = !anterior ? `🟢 NOVO LEAD (${this.config.agente.nome})` : `🔥 LEAD ESQUENTOU (${tempAnterior || '-'} → ${temp})`;
           const interesse = q.codigo_imovel_interesse && conv.imoveis[q.codigo_imovel_interesse];
-          await this.alertarEquipe(
+          await this.alertar(turno, () =>
             [
               titulo,
               this.cabecalhoCliente(conv),
               `Busca: ${this.resumoBusca(q)}`,
               `Prazo: ${q.prazo || 'não informado'}${temp ? ` (lead ${temp})` : ''} · Pagamento: ${q.pagamento || 'não informado'}`,
-              interesse ? `Interesse: ${interesse.tipo} no ${interesse.bairro} — ${interesse.preco_formatado}\n${interesse.url}` : '',
+              interesse ? `Interesse: ${interesse.tipo} · ${interesse.bairro} · ${interesse.preco_formatado}\n${interesse.url}` : '',
               conv.origem ? `Veio do site pelo imóvel ${conv.origem.codigo}` : '',
               `Imóveis apresentados: ${this.imoveisVistos(conv)}`,
               q.observacoes ? `Obs.: ${q.observacoes}` : '',
@@ -328,24 +339,51 @@ class Agente {
               .join('\n')
           );
         }
-        await this.enviarLeadImoview(conv);
+        if (!turno.simulacao) await this.enviarLeadImoview(conv);
         this.store.evento('lead', { fone: conv.fone, temperatura: temp });
         return { lead_id: `WA-${conv.fone.slice(-6)}`, etapa: 'qualificacao', temperatura: temp || 'indefinida' };
       }
 
       case 'agendar_visita': {
         const regras = this.config.comportamento.horarioVisitas;
-        const erro = validarHorarioVisita(regras, args.data, args.hora);
-        if (erro) {
-          return {
-            erro: `Horário inválido: ${erro}. Ofereça duas opções dentro das janelas abaixo.`,
-            janelas: proximosDiasVisita(regras, 4).map((d) => `${d.rotulo} [${d.data}] ${d.janela}`),
-          };
-        }
         const ficha = await this.imoview.detalhar(args.codigo_imovel);
         if (!ficha) return { erro: 'Imóvel não está mais disponível. Não reserve; avise o cliente e ofereça alternativas.' };
         this.registrarImoveis(conv, [ficha]);
         if (args.nome) conv.nome = String(args.nome).slice(0, 80);
+
+        // Mesma visita já reservada: só reconfirma (sem novo alerta).
+        const jaExiste = this.store.visitas.find((v) => v.fone === conv.fone && v.codigo === ficha.codigo && v.data === args.data && v.hora === args.hora);
+        if (jaExiste) {
+          return {
+            agendamento_id: jaExiste.id,
+            status: 'ja_reservado_aguardando_confirmacao',
+            quando: `${rotuloData(args.data)} às ${args.hora}`,
+            bairro: ficha.bairro,
+            condominio: ficha.condominio,
+            url: ficha.url,
+            proximo_passo: 'Esta visita já estava reservada. Apenas reconfirme ao cliente em uma linha, sem repetir tudo.',
+          };
+        }
+
+        // Barreira: só reserva se (a) a última mensagem do assistente foi uma oferta de horários
+        // (e não a lista de imóveis) ou (b) o próprio cliente disse um horário agora.
+        const reHora = /\b\d{1,2}\s?(?:h\b|h\d{2}|:\d{2})/gi;
+        const ultAgente = [...conv.historico].reverse().find((h) => h.papel === 'agente');
+        const ofereceu = !!ultAgente && (ultAgente.texto.match(reHora) || []).length >= 2 && !/\/imovel\/|\/imoveis\?q=/.test(ultAgente.texto);
+        const clienteDisse = (String(turno.textoCliente || '').match(reHora) || []).length >= 1;
+        if (!ofereceu && !clienteDisse) {
+          return {
+            erro: 'Ainda não há horário escolhido pelo cliente. NÃO reserve agora: ofereça duas opções concretas de dia e horário (das janelas abaixo), numa mensagem só sobre isso, e espere a escolha.',
+            janelas: proximosDiasVisita(regras, 4).map((d) => `${d.rotulo} [${d.data}] ${d.janela}`),
+          };
+        }
+        const erroHorario = validarHorarioVisita(regras, args.data, args.hora);
+        if (erroHorario) {
+          return {
+            erro: `Horário inválido: ${erroHorario}. Ofereça duas opções dentro das janelas abaixo.`,
+            janelas: proximosDiasVisita(regras, 4).map((d) => `${d.rotulo} [${d.data}] ${d.janela}`),
+          };
+        }
         const visita = {
           id: 'V' + Date.now().toString(36).toUpperCase(),
           fone: conv.fone,
@@ -364,21 +402,21 @@ class Agente {
         conv.qualificacao.codigo_imovel_interesse = ficha.codigo;
         conv.turnosSemAvanco = 0;
         turno.agendou = true;
-        await this.alertarEquipe(
+        await this.alertar(turno, () =>
           [
-            '📅 PEDIDO DE VISITA — confirmar com o cliente',
+            '📅 PEDIDO DE VISITA: confirmar com o cliente',
             this.cabecalhoCliente(conv),
             `Quando: ${rotuloData(args.data)} às ${args.hora}`,
-            `Imóvel ${ficha.codigo}: ${ficha.tipo} no ${ficha.bairro}${ficha.condominio ? ` (${ficha.condominio})` : ''} — ${ficha.preco_formatado}`,
+            `Imóvel ${ficha.codigo}: ${ficha.tipo} · ${ficha.bairro}${ficha.condominio ? ` (${ficha.condominio})` : ''} · ${ficha.preco_formatado}`,
             ficha.url,
             ficha.unidade_responsavel ? `Unidade: ${ficha.unidade_responsavel}` : '',
             visita.observacoes ? `Obs.: ${visita.observacoes}` : '',
-            'Responda o cliente pelo WhatsApp da MAFUZ para confirmar — o assistente se cala nesta conversa assim que alguém da equipe escrever.',
+            `Confirme com o cliente pelo WhatsApp da Mafuz. Quando você escrever, a ${this.config.agente.nome} para de responder essa conversa.`,
           ]
             .filter(Boolean)
             .join('\n')
         );
-        await this.enviarLeadImoview(conv, `Visita solicitada: ${rotuloData(args.data)} às ${args.hora} — imóvel ${ficha.codigo}`);
+        if (!turno.simulacao) await this.enviarLeadImoview(conv, `Visita solicitada: ${rotuloData(args.data)} às ${args.hora}, imóvel ${ficha.codigo}`);
         this.store.evento('visita', { fone: conv.fone, id: visita.id, codigo: ficha.codigo, data: args.data, hora: args.hora });
         return {
           agendamento_id: visita.id,
@@ -395,23 +433,31 @@ class Agente {
         const motivo = args.motivo || 'outro';
         const urgencia = args.urgencia || (['negociacao', 'alto_ticket', 'reclamacao', 'lgpd'].includes(motivo) ? 'alta' : 'normal');
         const horas = this.config.comportamento.pausaHumanoHoras;
-        this.store.pausar(conv.fone, horas, `transferido:${motivo}`);
+        const anterior = conv.encaminhamento;
+        const repetido = anterior && anterior.motivo === motivo && Date.now() - anterior.ts < 60 * 60000;
+        conv.encaminhamento = { motivo, urgencia, ts: repetido ? anterior.ts : Date.now() };
         conv.transferencias.push({ motivo, urgencia, resumo: args.resumo, ts: Date.now() });
         conv.turnosSemAvanco = 0;
         turno.transferiu = true;
-        await this.alertarEquipe(
-          [
-            `${urgencia === 'alta' ? '🔴' : '🟠'} ATENDIMENTO HUMANO — ${MOTIVO_LEGIVEL[motivo] || motivo}${urgencia === 'alta' ? ' (URGENTE)' : ''}`,
-            this.cabecalhoCliente(conv),
-            `Resumo: ${args.resumo || '-'}`,
-            `Busca: ${this.resumoBusca(conv.qualificacao)}`,
-            `Imóveis apresentados: ${this.imoveisVistos(conv)}`,
-            `O assistente ficou em silêncio nesta conversa por ${horas}h. Para devolver a ele: #retomar ${conv.fone}`,
-          ].join('\n')
-        );
-        if (motivo !== 'lgpd') await this.enviarLeadImoview(conv, `Transferido para humano: ${MOTIVO_LEGIVEL[motivo] || motivo}. ${args.resumo || ''}`);
-        this.store.evento('transferencia', { fone: conv.fone, motivo, urgencia });
-        return { encaminhado: true, protocolo: `T${Date.now().toString(36).toUpperCase()}` };
+        if (!repetido) {
+          await this.alertar(turno, () =>
+            [
+              `${urgencia === 'alta' ? '🔴' : motivo === 'qualificado' ? '🟢' : '🟠'} ${motivo === 'qualificado' ? 'CLIENTE PRONTO PARA O CORRETOR' : 'CHAMAR CORRETOR'}: ${MOTIVO_LEGIVEL[motivo] || motivo}${urgencia === 'alta' ? ' (URGENTE)' : ''}`,
+              this.cabecalhoCliente(conv),
+              `Resumo: ${args.resumo || '-'}`,
+              `Busca: ${this.resumoBusca(conv.qualificacao)}`,
+              `Imóveis enviados: ${this.imoveisVistos(conv)}`,
+              `A ${this.config.agente.nome} segue atendendo até alguém da equipe responder este cliente pelo WhatsApp da Mafuz. Quando você responder, ela para por ${horas}h.`,
+            ].join('\n')
+          );
+          if (motivo !== 'lgpd' && !turno.simulacao) await this.enviarLeadImoview(conv, `Encaminhado ao corretor: ${MOTIVO_LEGIVEL[motivo] || motivo}. ${args.resumo || ''}`);
+        }
+        this.store.evento('transferencia', { fone: conv.fone, motivo, urgencia, repetido: !!repetido });
+        return {
+          encaminhado: true,
+          ja_tinha_sido_avisado: !!repetido,
+          orientacao: 'O corretor foi avisado e vai falar com o cliente por este WhatsApp. Continue atendendo com gentileza até ele entrar na conversa.',
+        };
       }
 
       default:
@@ -425,7 +471,13 @@ class Agente {
     t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1: $2');
     t = t.replace(/\*\*([^*\n]+)\*\*/g, '*$1*');
     t = t.replace(/^#{1,6}\s*/gm, '');
-    t = t.replace(/^\s*[-•]\s+/gm, '');
+    t = t.replace(/^\s*[-•—–]\s+/gm, '');
+    // Sem travessões na conversa (regra da Mafuz): vira vírgula, e faixas numéricas viram "a".
+    t = t.replace(/(\d)\s*[—–]\s*(\d)/g, '$1 a $2');
+    t = t.replace(/\s*[—–]\s*/g, ', ');
+    t = t.replace(/ +- +/g, ', ');
+    t = t.replace(/,\s*,/g, ',').replace(/,\s*([.!?:])/g, '$1').replace(/^\s*,\s*/gm, '').replace(/\(\s*,\s*/g, '(');
+    t = t.replace(/[ \t]+$/gm, '');
 
     const permitidas = new Set(conv.urlsPermitidas);
     let hostSite = '';
@@ -462,11 +514,12 @@ class Agente {
 
   // ---------------- turno completo ----------------
   async responder(conv, textoCliente, sinais = {}) {
-    const sistema = montarSistema({ conv, config: this.config, sinais });
+    const totalCarteira = this.catalogo && this.catalogo.pronto() ? this.catalogo.itens.length : 0;
+    const sistema = montarSistema({ conv, config: this.config, sinais, totalCarteira });
     const historico = conv.historico.slice(-24).map((h) => ({ role: h.papel === 'cliente' ? 'user' : 'assistant', content: h.texto }));
     while (historico.length && historico[0].role !== 'user') historico.shift();
     const mensagens = [...historico, { role: 'user', content: textoCliente }];
-    const turno = { buscou: false, registrou: false, agendou: false, transferiu: false, ferramentas: [] };
+    const turno = { buscou: false, registrou: false, agendou: false, transferiu: false, ferramentas: [], alertas: [], textoCliente, simulacao: !!sinais.simulacao };
 
     let final = '';
     for (let passo = 0; passo < 6; passo++) {
@@ -495,11 +548,14 @@ class Agente {
     if (sinais.negociacao && !turno.transferiu) {
       await this.executar('transferir_humano', { motivo: 'negociacao', urgencia: 'alta', resumo: `Cliente escreveu: "${textoCliente.slice(0, 300)}"` }, conv, turno);
       if (!/conect|corretor|equipe/i.test(final)) {
-        final = `${final ? final + '\n\n' : ''}Proposta e condição de valor quem conduz é o nosso time diretamente. Vou te conectar agora com ${this.config.equipe.nomeTransferencia} — já passei todo o nosso histórico.`;
+        final = `${final ? final + '\n\n' : ''}Condições de valor quem conduz é a nossa equipe diretamente. Já chamei ${this.config.equipe.nomeTransferencia}, que vai falar com você por aqui.`;
       }
     }
 
-    if (!final) final = 'Só um instante — vou confirmar essa informação com o corretor responsável e já te retorno por aqui.';
+    if (!final) final = 'Me dá só um instante, vou confirmar essa informação e já te retorno por aqui.';
+    if ((turno.registrou || turno.agendou) && !conv.lgpdAvisado && !/pol[ií]tica de privacidade/i.test(final)) {
+      final += '\n\nSeus dados são usados apenas para o seu atendimento, conforme nossa política de privacidade.';
+    }
     return { texto: this.guardar(final, conv), turno };
   }
 }

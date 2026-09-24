@@ -84,6 +84,20 @@ const PALAVRAS_FLAG = [
   [/solar|sol da manha/, ['solmanha', 'aquecedorsolar']],
 ];
 
+// Remove contatos, links e travessões da descrição do anúncio antes de ela chegar ao modelo.
+function limparDescricao(texto) {
+  return String(texto || '')
+    .replace(/\r/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\(?\d{2}\)?\s?\d{4,5}-?\d{4}/g, '')
+    .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '')
+    .replace(/\s+[—–]\s+/g, ', ')
+    .replace(/[—–]/g, ', ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function levenshtein(a, b) {
   if (a === b) return 0;
   const m = a.length;
@@ -442,14 +456,7 @@ class Imoview {
       .filter(([k]) => i[k] === true)
       .map(([, v]) => v);
     if (parseNumBR(i.numeroelevador) > 0) diferenciais.push('elevador');
-    const descricao = String(i.descricao || '')
-      .replace(/\r/g, '')
-      .replace(/https?:\/\/\S+/g, '')
-      .replace(/\(?\d{2}\)?\s?\d{4,5}-?\d{4}/g, '')
-      .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim()
-      .slice(0, 1400);
+    const descricao = limparDescricao(i.descricao).slice(0, 1400);
     const ficha = {
       ...base,
       titulo: limparTitulo(i.titulo),
@@ -488,4 +495,4 @@ class Imoview {
   }
 }
 
-module.exports = { Imoview, casaNome, GRUPOS_TIPO };
+module.exports = { Imoview, casaNome, GRUPOS_TIPO, DIFERENCIAIS, PALAVRAS_FLAG, limparDescricao, levenshtein };
