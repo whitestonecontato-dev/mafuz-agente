@@ -13,7 +13,7 @@ const { Agente } = require('./agent');
 const { Catalogo } = require('./catalogo');
 const { log, digitos, dentroDoHorario, foneExibicao, sleep } = require('./util');
 
-const VERSAO = '1.0.0';
+const VERSAO = '2.0.0';
 const inicio = Date.now();
 
 const store = new Store(config.dataDir, { conversaTtlDias: config.comportamento.conversaTtlDias });
@@ -48,7 +48,7 @@ function chaveFone(f) {
   return d.length >= 10 ? d.slice(0, 2) + d.slice(-8) : d;
 }
 const mesmoFone = (a, b) => chaveFone(a) === chaveFone(b);
-const internos = () => [...config.equipe.admins, ...config.equipe.alertas];
+const internos = () => [...config.equipe.admins, ...config.equipe.alertas, ...config.equipe.venda, ...config.equipe.locacao];
 const ehInterno = (fone) => internos().some((x) => mesmoFone(x, fone));
 // Modo teste: um número da equipe passa a conversar com o agente como se fosse cliente
 // (comandos com # continuam funcionando). Ligado/desligado por #teste.
@@ -77,7 +77,9 @@ function enfileirar(fone, item) {
   }
   f.itens.push(item);
   clearTimeout(f.timer);
-  f.timer = setTimeout(() => processarFila(fone), config.comportamento.debounceMs);
+  // Espera o cliente terminar de digitar (tempo base + variação, para não soar automático).
+  const espera = config.comportamento.debounceMs + Math.round(Math.random() * config.comportamento.debounceVariacaoMs);
+  f.timer = setTimeout(() => processarFila(fone), espera);
 }
 
 async function processarFila(fone) {
@@ -152,15 +154,68 @@ async function detectarOrigem(conv, texto) {
   }
 }
 
-async function enviarResposta(fone, texto) {
-  let partes = texto.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  if (partes.length > 6) partes = [...partes.slice(0, 5), partes.slice(5).join('\n\n')];
-  for (let i = 0; i < partes.length; i++) {
-    const p = partes[i];
-    agente.marcarEnviado(fone, p);
-    const digitando = i === 0 ? 2 : Math.min(6, 1 + Math.round(p.length / 90));
-    await zapi.enviarTexto(fone, p, { delayTyping: digitando });
+// Ritmo humano: "digitando..." proporcional ao tamanho (2 a 6 s, com variação), no máximo
+// MAX_MENSAGENS textos por resposta e os imóveis em cartões separados (foto + legenda + link).
+function tempoDigitando(texto) {
+  const base = 2 + Math.min(4, String(texto).length / 70);
+  return Math.max(2, Math.min(6, Math.round(base + (Math.random() - 0.5))));
+}
+
+async function fotoEmBase64(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return null;
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length < 2000 || buf.length > 4.5 * 1024 * 1024) return null;
+    const tipo = buf[0] === 0x89 ? 'image/png' : buf.slice(8, 12).toString() === 'WEBP' ? 'image/webp' : 'image/jpeg';
+    return `data:${tipo};base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
   }
+}
+
+async function enviarCartao(fone, cartao) {
+  agente.marcarEnviado(fone, cartao.legenda);
+  if (config.comportamento.enviarFotos) {
+    const foto = await site.capa(cartao.codigo, cartao.url);
+    const imagem = foto ? await fotoEmBase64(foto) : null;
+    if (imagem) {
+      try {
+        await zapi.enviarImagem(fone, imagem, cartao.legenda, { delayTyping: 2 });
+        return;
+      } catch (e) {
+        log('cartao_foto_erro', { codigo: cartao.codigo, erro: e.message });
+      }
+    }
+  }
+  await zapi.enviarTexto(fone, cartao.legenda, { delayTyping: 2 });
+}
+
+async function enviarResposta(fone, texto, cartoes = []) {
+  let partes = String(texto || '').split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  const max = Math.max(1, config.comportamento.maxMensagens);
+  if (partes.length > max) partes = [...partes.slice(0, max - 1), partes.slice(max - 1).join('\n\n')];
+  const enviarTxt = async (p) => {
+    agente.marcarEnviado(fone, p);
+    await zapi.enviarTexto(fone, p, { delayTyping: tempoDigitando(p) });
+  };
+  if (!cartoes.length) {
+    for (const p of partes) await enviarTxt(p);
+    return;
+  }
+  // Com imóveis: introdução, cartões e, por último, a pergunta de continuação.
+  let antes = partes;
+  let depois = [];
+  if (partes.length >= 2) {
+    antes = [partes[0]];
+    depois = partes.slice(1);
+  } else if (partes.length === 1 && /\?\s*$/.test(partes[0])) {
+    antes = [];
+    depois = partes;
+  }
+  for (const p of antes) await enviarTxt(p);
+  for (const c of cartoes) await enviarCartao(fone, c);
+  for (const p of depois) await enviarTxt(p);
 }
 
 async function atender(fone, itens) {
@@ -173,6 +228,9 @@ async function atender(fone, itens) {
   }
 
   const primeira = conv.historico.length === 0;
+  const optOut = RE_OPTOUT.test(texto);
+  if (optOut) conv.optOut = true;
+  else if (conv.optOut && conv.historico.length && /\b(quero|procuro|tem|gostaria|pode)\b/i.test(texto)) conv.optOut = false;
   await detectarOrigem(conv, texto);
   conv.turnosCliente += 1;
   conv.turnosSemAvanco += 1;
@@ -181,6 +239,7 @@ async function atender(fone, itens) {
     audio,
     negociacao: agente.detectarNegociacao(texto),
     limiteTurnos: conv.turnosSemAvanco >= config.comportamento.maxTurnosSemAvanco,
+    optOut,
   };
 
   // Falha do modelo: tenta de novo em silêncio; se falhar outra vez, avisa o cliente com gentileza,
@@ -207,9 +266,9 @@ async function atender(fone, itens) {
   }
 
   const enviarAlertas = async () => {
-    for (const montar of resposta.turno.alertas || []) {
+    for (const a of resposta.turno.alertas || []) {
       try {
-        await agente.alertarEquipe(montar());
+        await agente.alertarEquipe(a.montar(), a.carteira);
       } catch (e) {
         log('alerta_erro', { erro: e.message });
       }
@@ -221,9 +280,10 @@ async function atender(fone, itens) {
     log('resposta_descartada_humano_assumiu', { fone: mascarar(fone) });
     return enviarAlertas();
   }
-  if (resposta.texto) {
-    store.adicionarHistorico(conv, 'agente', resposta.texto);
-    await enviarResposta(fone, resposta.texto);
+  if (resposta.texto || resposta.turno.cartoes.length) {
+    const registro = [resposta.texto, ...resposta.turno.cartoes.map((c) => `[imóvel enviado com foto] ${c.legenda.replace(/\*/g, '')}`)].filter(Boolean).join('\n\n');
+    store.adicionarHistorico(conv, 'agente', registro);
+    await enviarResposta(fone, resposta.texto, resposta.turno.cartoes);
   }
   await enviarAlertas();
   store.evento('resposta', { fone, ferramentas: resposta.turno.ferramentas });
@@ -247,6 +307,7 @@ async function comando(fone, texto) {
         `Conversas nas últimas 24h: ${ativas}`,
         `Leads atualizados nas últimas 24h: ${leadsHoje}`,
         `Pedidos de visita registrados: ${visitas}`,
+        `Reengajamentos nas últimas 24h: ${store.eventos.filter((e) => e.tipo === 'reengajamento' && Date.parse(e.ts) > dia).length}`,
         `Em silêncio (humano atendendo): ${pausadas.length}${pausadas.length ? '\n' + pausadas.slice(0, 10).map((c) => `- ${c.nome || ''} ${foneExibicao(c.fone)}`).join('\n') : ''}`,
       ].join('\n');
       break;
@@ -345,7 +406,9 @@ async function processarWebhook(p) {
     if (p.fromApi || agente.foiEnviadoPorNos(fone, texto)) return rastrear(p, 'enviada pela assistente');
     if (ehInterno(fone)) return rastrear(p, 'enviada para a equipe');
     // Alguém da equipe respondeu pelo celular / WhatsApp Web: a assistente se cala nesta conversa.
-    store.pausar(fone, config.comportamento.pausaHumanoHoras, 'humano_assumiu');
+    // A cada mensagem do corretor, o silêncio recomeça; sem nova mensagem por PAUSA_HUMANO_MIN, a Gabi volta.
+    store.pausarMin(fone, config.comportamento.pausaHumanoMin, 'humano_assumiu');
+    store.conversa(fone).humanoAssumiuEm = Date.now();
     const f = filas.get(fone);
     if (f) {
       clearTimeout(f.timer);
@@ -389,6 +452,89 @@ async function processarWebhook(p) {
   enfileirar(fone, item);
 }
 
+// ---------------- reengajamento (cutucada de 15 min e follow-ups) ----------------
+const RE_OPTOUT = /\b(pare de (me )?(mandar|enviar)|n[aã]o (me )?(mande|envie) mais|n[aã]o quero mais (mensagens?|receber)|n[aã]o tenho (mais )?interesse|sem interesse|me (remova|tire) d|descadastr|sair da lista|stop)\b/i;
+
+function janelaAberta(data = new Date()) {
+  return dentroDoHorario(config.reengajamento.janelaRegras, data);
+}
+
+function tipoReengajamento(conv, agora = Date.now()) {
+  const R = config.reengajamento;
+  const esc = R.escala;
+  const h = conv.historico || [];
+  if (!h.length || conv.optOut || (conv.visitas || []).length) return null;
+  const ultima = h[h.length - 1];
+  if (ultima.papel !== 'agente') return null;
+  const ultCliente = [...h].reverse().find((x) => x.papel === 'cliente');
+  if (!ultCliente) return null;
+  if (conv.humanoAssumiuEm && conv.humanoAssumiuEm > ultCliente.ts) return null;
+  conv.reeng = conv.reeng || { cutucadaDe: 0, followups: {} };
+  const desdeAgente = agora - ultima.ts;
+  const desdeCliente = agora - ultCliente.ts;
+  const dia = 86400000 * esc;
+  const dias = [...R.followupDias].sort((a, b) => b - a);
+  for (const d of dias) {
+    if (desdeCliente >= d * dia && conv.reeng.followups[d] !== ultCliente.ts) {
+      const anterior = dias.filter((x) => x < d);
+      const faltaAnterior = anterior.length && conv.reeng.followups[anterior[0]] !== ultCliente.ts;
+      if (faltaAnterior) continue;
+      return { tipo: d === Math.min(...R.followupDias) ? 'followup3' : 'followup7', marcar: () => (conv.reeng.followups[d] = ultCliente.ts) };
+    }
+  }
+  const min = 60000 * esc;
+  if (
+    !conv.reeng.cutucadaDe &&
+    desdeAgente >= R.cutucadaMin * min &&
+    desdeAgente < 180 * min &&
+    /\?\s*$/.test(ultima.texto.split('\n\n').pop() || '')
+  ) {
+    return { tipo: 'cutucada', marcar: () => (conv.reeng.cutucadaDe = ultCliente.ts) };
+  }
+  return null;
+}
+
+let reengajandoAgora = false;
+async function cicloReengajamento() {
+  if (!config.reengajamento.ativo || reengajandoAgora || !botAtivo()) return;
+  if (!janelaAberta()) return;
+  reengajandoAgora = true;
+  try {
+    for (const conv of Object.values(store.conversas)) {
+      if (!conv || !conv.fone || /^simulacao|^site/.test(conv.fone)) continue;
+      if (store.pausado(conv.fone)) continue;
+      if (ehInterno(conv.fone) && !emModoTeste(conv.fone)) continue;
+      const f = filas.get(conv.fone);
+      if (f && (f.rodando || f.itens.length)) continue;
+      const alvo = tipoReengajamento(conv);
+      if (!alvo) continue;
+      alvo.marcar();
+      store.tocar();
+      await reengajarConversa(conv, alvo.tipo);
+    }
+  } catch (e) {
+    log('reengajamento_erro', { erro: e.message });
+  } finally {
+    reengajandoAgora = false;
+  }
+}
+
+async function reengajarConversa(conv, tipo) {
+  try {
+    const r = await agente.reengajar(conv, tipo);
+    if (!r.texto && !r.turno.cartoes.length) return false;
+    const registro = [r.texto, ...r.turno.cartoes.map((c) => `[imóvel enviado com foto] ${c.legenda.replace(/\*/g, '')}`)].filter(Boolean).join('\n\n');
+    store.adicionarHistorico(conv, 'agente', registro);
+    await enviarResposta(conv.fone, r.texto, r.turno.cartoes);
+    store.evento('reengajamento', { fone: conv.fone, tipo });
+    log('reengajamento', { fone: mascarar(conv.fone), tipo });
+    return true;
+  } catch (e) {
+    log('reengajamento_falha', { fone: mascarar(conv.fone), tipo, erro: e.message });
+    return false;
+  }
+}
+
 // Situação da conexão do WhatsApp na Z-API (consultada no máximo a cada 60 s).
 let statusWhats = { valor: 'não verificado', ts: 0 };
 async function situacaoWhatsApp() {
@@ -424,6 +570,17 @@ function responderJson(res, status, obj) {
   res.end(JSON.stringify(obj, null, 2));
 }
 
+// Limite simples do chat do site: 20 mensagens por minuto por IP.
+const acessosSite = new Map();
+function limiteSite(ip) {
+  const agora = Date.now();
+  const l = (acessosSite.get(ip) || []).filter((t) => agora - t < 60000);
+  l.push(agora);
+  acessosSite.set(ip, l);
+  if (acessosSite.size > 5000) acessosSite.clear();
+  return l.length <= 20;
+}
+
 function autorizadoAdmin(url) {
   return !!config.adminToken && url.searchParams.get('token') === config.adminToken;
 }
@@ -450,6 +607,47 @@ const servidor = http.createServer(async (req, res) => {
         no_ar_ha_min: Math.round((Date.now() - inicio) / 60000),
         config_faltando: validar(),
       });
+    }
+
+    // Chat da Gabi no site (mesmo cérebro do WhatsApp). Resposta em SSE, formato OpenAI.
+    if (url.pathname === '/site/chat') {
+      const origem = req.headers.origin || '';
+      const permitida = config.site.origensChat.includes(origem) || config.site.origensChat.includes('*');
+      const cors = {
+        'Access-Control-Allow-Origin': permitida ? origem || '*' : config.site.url,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey',
+        Vary: 'Origin',
+      };
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, cors);
+        return res.end();
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405, cors);
+        return res.end();
+      }
+      const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+      if (!limiteSite(ip)) {
+        res.writeHead(429, { ...cors, 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Muitas mensagens em pouco tempo. Tente de novo em um minuto.' }));
+      }
+      let corpo = {};
+      try {
+        corpo = JSON.parse((await lerCorpo(req, 200 * 1024)) || '{}');
+      } catch {}
+      let texto;
+      try {
+        texto = (await agente.responderSite(corpo.messages)).texto;
+      } catch (e) {
+        log('site_chat_erro', { erro: e.message });
+        texto = 'Tive uma instabilidade agora. Pode repetir a pergunta? Se preferir, fale comigo pelo WhatsApp (31) 97537-7934.';
+      }
+      res.writeHead(200, { ...cors, 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: texto } }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      store.evento('site_chat', { ip: ip.slice(0, 7) });
+      return res.end();
     }
 
     if (req.method === 'POST' && url.pathname === '/webhook/zapi') {
@@ -522,9 +720,22 @@ const servidor = http.createServer(async (req, res) => {
           conversa: chave,
           segundos: Math.round((Date.now() - t0) / 100) / 10,
           mensagens: r.texto.split(/\n\s*\n/).map((m) => m.trim()).filter(Boolean),
+          imoveis_com_foto: r.turno.cartoes.map((c) => c.legenda),
           ferramentas: r.turno.ferramentas,
-          alertas_para_equipe: (r.turno.alertas || []).map((f) => f()),
+          alertas_para_equipe: (r.turno.alertas || []).map((x) => ({ para: x.carteira || 'gestão', texto: x.montar() })),
         });
+      }
+
+      // Dispara um reengajamento agora (teste com o próprio número). Envia mensagem de verdade.
+      // Ex.: /admin/reengajar?token=...&fone=5531999999999&tipo=cutucada|followup3|followup7
+      if (url.pathname === '/admin/reengajar') {
+        const alvo = acharConversa(url.searchParams.get('fone') || '');
+        const conv = alvo && store.conversas[alvo];
+        const tipo = String(url.searchParams.get('tipo') || 'cutucada');
+        if (!conv) return responderJson(res, 404, { erro: 'conversa não encontrada' });
+        if (!['cutucada', 'followup3', 'followup7'].includes(tipo)) return responderJson(res, 400, { erro: 'tipo inválido' });
+        const ok = await reengajarConversa(conv, tipo);
+        return responderJson(res, 200, { ok, tipo, fone: alvo });
       }
 
       if (url.pathname === '/admin/leads.csv') {
@@ -533,7 +744,7 @@ const servidor = http.createServer(async (req, res) => {
           const q = l.qualificacao || {};
           linhas.push([l.atualizadoEm, l.nome, l.fone, l.temperatura, q.finalidade, q.tipo, q.cidade, [].concat(q.bairros || []).join(', '), q.preco_min, q.preco_max, q.dormitorios, q.prazo, q.pagamento, q.codigo_imovel_interesse, q.observacoes]);
         }
-        res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="leads-mafuz-ia.csv"' });
+        res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="leads-gabi-mafuz.csv"' });
         return res.end('﻿' + csv(linhas));
       }
 
@@ -549,7 +760,11 @@ const servidor = http.createServer(async (req, res) => {
             assistente: config.agente.nome,
             site: config.site.url,
             modelo: config.llm.provedor === 'openai' ? config.llm.openaiModelo : config.llm.anthropicModelo,
-            numeros_equipe: config.equipe.alertas.map((n) => '••' + n.slice(-4)),
+            numeros_gestao: config.equipe.alertas.map((n) => '••' + n.slice(-4)),
+            corretores_venda: config.equipe.venda.map((n) => '••' + n.slice(-4)),
+            corretores_locacao: config.equipe.locacao.map((n) => '••' + n.slice(-4)),
+            silencio_apos_corretor_min: config.comportamento.pausaHumanoMin,
+            reengajamento: { ativo: config.reengajamento.ativo, cutucada_min: config.reengajamento.cutucadaMin, followups_dias: config.reengajamento.followupDias, janela: config.reengajamento.janela },
             em_modo_teste: Object.keys(store.global.testers || {}).map((n) => '••' + n.slice(-4)),
           },
           catalogo: catalogo.status(),
@@ -589,6 +804,9 @@ function iniciar() {
     imoview.garantirListas().catch(() => {});
     catalogo.iniciar(config.catalogo.sincronizarACadaMin);
   }
+  // Varre as conversas em busca de cutucadas e follow-ups (a cada minuto; mais rápido em teste).
+  const tick = config.reengajamento.escala < 1 ? 1000 : 60000;
+  setInterval(() => cicloReengajamento().catch(() => {}), tick).unref();
   const encerrar = () => {
     store.salvar(true);
     process.exit(0);
@@ -599,4 +817,4 @@ function iniciar() {
 
 if (require.main === module) iniciar();
 
-module.exports = { servidor, processarWebhook, store, agente, imoview, catalogo, filas, iniciar, chaveFone, rastro };
+module.exports = { servidor, processarWebhook, store, agente, imoview, catalogo, filas, iniciar, chaveFone, rastro, cicloReengajamento, tipoReengajamento };

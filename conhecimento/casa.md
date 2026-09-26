@@ -37,9 +37,11 @@ estiver confirmado: o agente trata tudo aqui como fato. Não use travessões.
   (motivo "busca_dedicada").
 
 ## Site
-- mafuz.com.br: cada imóvel tem uma ficha com fotos, descrição e o Mafuz Index (MFI),
+- mafuz.site: cada imóvel tem uma ficha com fotos, descrição e o Mafuz Index (MFI),
   uma nota de 0 a 100 que avalia documentação, localização, estrutura, amenidades,
   qualidade das fotos e competitividade de preço.
+- Para quem quer vender: mafuz.site/venda-seu-imovel (pedido de avaliação sem compromisso).
+- Nunca envie links do Imoview nem de outros portais: só links do mafuz.site.
 
 ## Visitas
 - Toda visita é acompanhada por um corretor da MAFUZ.

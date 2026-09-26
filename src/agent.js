@@ -16,7 +16,7 @@ const FERRAMENTAS = [
   {
     name: 'buscar_imoveis',
     description:
-      'Busca na carteira INTEIRA da Mafuz (todos os imóveis do Imoview, à venda e para alugar), lendo inclusive a descrição de cada anúncio. Use sempre que o cliente disser o que procura ou pedir outro recorte. Coloque os desejos do cliente em texto_livre. Retorna até 5 imóveis com resumo, o que atende ao pedido, destaques, oportunidade e link; apresente no máximo 3.',
+      'Busca na carteira INTEIRA da Mafuz (todos os imóveis do Imoview, à venda e para alugar), lendo inclusive a descrição de cada anúncio. Use sempre que o cliente disser o que procura ou pedir outro recorte. Coloque os desejos do cliente em texto_livre. Retorna até 6 imóveis com resumo, o que atende ao pedido, destaques, oportunidade e link. Depois, apresente até 4 com enviar_imoveis.',
     parameters: {
       type: 'object',
       properties: {
@@ -33,7 +33,44 @@ const FERRAMENTAS = [
         texto_livre: { type: 'string', description: 'Desejos qualitativos: "piscina", "vista para a serra", "aceita pet", "varanda gourmet"' },
         codigo: { type: 'string', description: 'Código do imóvel, quando o cliente citar um código' },
         ordenar: { type: 'string', enum: ['relevancia', 'menor_preco', 'maior_preco', 'maior_area'], description: 'Padrão: relevância para o pedido e melhores oportunidades' },
-        limite: { type: 'integer', description: 'Máximo de resultados (até 5)' },
+        limite: { type: 'integer', description: 'Máximo de resultados (até 6)' },
+      },
+    },
+  },
+  {
+    name: 'enviar_imoveis',
+    description:
+      'Envia ao cliente até 4 imóveis, cada um em uma mensagem separada com a foto de capa, os dados principais e o link do site. Use depois de buscar_imoveis ou detalhar_imovel. Na sua resposta final não repita os imóveis: escreva só uma introdução curta e a pergunta de continuação.',
+    parameters: {
+      type: 'object',
+      properties: {
+        imoveis: {
+          type: 'array',
+          maxItems: 4,
+          items: {
+            type: 'object',
+            properties: {
+              codigo: { type: 'string', description: 'Código do imóvel (vem de buscar_imoveis)' },
+              motivo: { type: 'string', description: 'Uma frase curta: por que este imóvel combina com este cliente. Só com dados da busca.' },
+            },
+            required: ['codigo', 'motivo'],
+          },
+        },
+      },
+      required: ['imoveis'],
+    },
+  },
+  {
+    name: 'mercado_regiao',
+    description:
+      'Retrato de preços de uma região a partir da carteira ativa da Mafuz: quantidade de imóveis, preço mediano, faixa de preço, valor mediano por m² (quando a amostra permite), novidades dos últimos 30 dias e imóveis com preço reduzido. Use para perguntas de mercado, preço do m² ou movimento de um bairro. Não é índice oficial.',
+    parameters: {
+      type: 'object',
+      properties: {
+        bairro: { type: 'string', description: 'Bairro ou condomínio, ex.: Vila da Serra, Alphaville, Belvedere' },
+        cidade: { type: 'string', description: 'Cidade, ex.: Nova Lima, Belo Horizonte, Lagoa Santa' },
+        tipo: { type: 'string', description: 'apartamento | casa | cobertura | lote | comercial' },
+        finalidade: { type: 'string', enum: ['venda', 'locacao'] },
       },
     },
   },
@@ -91,7 +128,7 @@ const FERRAMENTAS = [
   {
     name: 'transferir_humano',
     description:
-      'Passa a conversa para um corretor, com resumo. O assistente para de responder este cliente depois disso. Use nos gatilhos de transferência.',
+      'Avisa os corretores da carteira certa (venda ou locação) para assumirem a conversa, com resumo. A Gabi continua atendendo até um corretor escrever. Use nos gatilhos de transferência.',
     parameters: {
       type: 'object',
       properties: {
@@ -114,7 +151,7 @@ const FERRAMENTAS = [
           ],
         },
         urgencia: { type: 'string', enum: ['normal', 'alta'] },
-        resumo: { type: 'string', description: 'Resumo objetivo: quem é, o que procura, imóveis vistos, o que pediu' },
+        resumo: { type: 'string', description: 'Resumo em 3 linhas curtas: quem é, o que procura, o que pediu' },
       },
       required: ['motivo', 'resumo'],
     },
@@ -158,8 +195,27 @@ class Agente {
   }
 
   // ---------------- alertas para a equipe ----------------
-  async alertarEquipe(texto) {
-    for (const fone of this.config.equipe.alertas) {
+  // Carteira da conversa: locação quando o cliente quer alugar ou o imóvel é de locação; senão, venda.
+  carteiraDe(conv, ficha) {
+    const f = String((ficha && ficha.finalidade) || '').toLowerCase();
+    if (/loca|alug/.test(f)) return 'locacao';
+    if (f) return 'venda';
+    const q = (conv && conv.qualificacao) || {};
+    if (q.finalidade === 'alugar') return 'locacao';
+    const i = q.codigo_imovel_interesse && conv.imoveis && conv.imoveis[q.codigo_imovel_interesse];
+    if (i && i.finalidade === 'locacao') return 'locacao';
+    return 'venda';
+  }
+
+  destinatarios(carteira) {
+    const eq = this.config.equipe;
+    const lista = [...eq.alertas, ...(carteira === 'locacao' ? eq.locacao : carteira === 'venda' ? eq.venda : [])];
+    return [...new Set(lista)];
+  }
+
+  async alertarEquipe(texto, carteira = null) {
+    const dest = this.destinatarios(carteira);
+    for (const fone of dest) {
       try {
         this.marcarEnviado(fone, texto);
         await this.zapi.enviarTexto(fone, texto);
@@ -167,14 +223,14 @@ class Agente {
         log('alerta_erro', { erro: e.message });
       }
     }
-    if (!this.config.equipe.alertas.length) log('alerta_sem_destino', { texto: texto.slice(0, 200) });
+    if (!dest.length) log('alerta_sem_destino', { texto: texto.slice(0, 200) });
   }
 
   // Alertas saem DEPOIS da resposta ao cliente (e com os imóveis já marcados como apresentados).
   // Sem turno (ex.: falha técnica), sai na hora.
-  async alertar(turno, montarTexto) {
-    if (turno && Array.isArray(turno.alertas)) turno.alertas.push(montarTexto);
-    else await this.alertarEquipe(montarTexto());
+  async alertar(turno, montarTexto, carteira = null) {
+    if (turno && Array.isArray(turno.alertas)) turno.alertas.push({ montar: montarTexto, carteira });
+    else await this.alertarEquipe(montarTexto(), carteira);
   }
 
   marcarEnviado(fone, texto) {
@@ -215,7 +271,7 @@ class Agente {
     if (!this.config.imoview.enviarLeads || conv.leadEnviadoImoview) return;
     const q = conv.qualificacao;
     const anotacoes = [
-      'Lead qualificado pela Mafuz IA (WhatsApp).',
+      `Lead qualificado pela ${this.config.agente.nome} (WhatsApp).`,
       `Busca: ${this.resumoBusca(q)}`,
       q.prazo ? `Prazo: ${q.prazo}` : '',
       q.pagamento ? `Pagamento: ${q.pagamento}` : '',
@@ -256,6 +312,13 @@ class Agente {
         preco: i.preco,
         preco_formatado: i.preco_formatado,
         url: i.url,
+        finalidade: i.finalidade ? (/loca|alug/i.test(i.finalidade) ? 'locacao' : 'venda') : (conv.imoveis[i.codigo] || {}).finalidade,
+        dormitorios: i.dormitorios,
+        suites: i.suites,
+        vagas: i.vagas,
+        area_m2: i.area_m2,
+        area_lote_m2: i.area_lote_m2,
+        condominio: i.condominio,
         unidade: i.unidade_responsavel || (conv.imoveis[i.codigo] || {}).unidade,
       };
       if (i.url && !conv.urlsPermitidas.includes(i.url)) conv.urlsPermitidas.push(i.url);
@@ -285,6 +348,35 @@ class Agente {
         turno.buscou = true;
         this.store.evento('busca', { fone: conv.fone, filtros: args, total: r.total_encontrado, codigos: r.imoveis.map((i) => i.codigo) });
         return r;
+      }
+
+      case 'enviar_imoveis': {
+        const pedidos = Array.isArray(args.imoveis) ? args.imoveis.slice(0, 4) : [];
+        const cartoes = [];
+        const recusados = [];
+        for (const p of pedidos) {
+          const cod = String((p && p.codigo) || '').trim();
+          const i = conv.imoveis[cod];
+          if (!i || !i.url) {
+            recusados.push(cod);
+            continue;
+          }
+          if (turno.cartoes.some((c) => c.codigo === cod) || cartoes.some((c) => c.codigo === cod)) continue;
+          cartoes.push({ codigo: cod, url: i.url, legenda: this.legendaImovel(i, p.motivo) });
+          i.apresentado = true;
+        }
+        turno.cartoes.push(...cartoes.slice(0, Math.max(0, 4 - turno.cartoes.length)));
+        return {
+          enviados: cartoes.map((c) => c.codigo),
+          ...(recusados.length ? { recusados, aviso: 'Estes códigos não vieram de uma busca desta conversa e não foram enviados.' } : {}),
+          orientacao:
+            'Os imóveis vão em mensagens separadas, com foto e link. Na resposta final escreva só: 1) uma introdução curta e 2) a pergunta de continuação. Não repita imóveis nem links.',
+        };
+      }
+
+      case 'mercado_regiao': {
+        if (!this.catalogo || !this.catalogo.pronto()) return { erro: 'Carteira ainda carregando. Diga que o corretor traz o estudo da região.' };
+        return this.catalogo.mercadoRegiao(args);
       }
 
       case 'detalhar_imovel': {
@@ -373,7 +465,7 @@ class Agente {
         const clienteDisse = (String(turno.textoCliente || '').match(reHora) || []).length >= 1;
         if (!ofereceu && !clienteDisse) {
           return {
-            erro: 'Ainda não há horário escolhido pelo cliente. NÃO reserve agora: ofereça duas opções concretas de dia e horário (das janelas abaixo), numa mensagem só sobre isso, e espere a escolha.',
+            erro: 'O cliente ainda não disse dia e horário. NÃO reserve agora: pergunte "Qual o melhor dia e horário para você?" (se ele pedir sugestão, ofereça duas opções das janelas abaixo) e espere a resposta.',
             janelas: proximosDiasVisita(regras, 4).map((d) => `${d.rotulo} [${d.data}] ${d.janela}`),
           };
         }
@@ -402,19 +494,23 @@ class Agente {
         conv.qualificacao.codigo_imovel_interesse = ficha.codigo;
         conv.turnosSemAvanco = 0;
         turno.agendou = true;
-        await this.alertar(turno, () =>
-          [
-            '📅 PEDIDO DE VISITA: confirmar com o cliente',
-            this.cabecalhoCliente(conv),
-            `Quando: ${rotuloData(args.data)} às ${args.hora}`,
-            `Imóvel ${ficha.codigo}: ${ficha.tipo} · ${ficha.bairro}${ficha.condominio ? ` (${ficha.condominio})` : ''} · ${ficha.preco_formatado}`,
-            ficha.url,
-            ficha.unidade_responsavel ? `Unidade: ${ficha.unidade_responsavel}` : '',
-            visita.observacoes ? `Obs.: ${visita.observacoes}` : '',
-            `Confirme com o cliente pelo WhatsApp da Mafuz. Quando você escrever, a ${this.config.agente.nome} para de responder essa conversa.`,
-          ]
-            .filter(Boolean)
-            .join('\n')
+        const carteiraVisita = this.carteiraDe(conv, ficha);
+        await this.alertar(
+          turno,
+          () =>
+            [
+              `🔔 NOVO LEAD · ${carteiraVisita === 'locacao' ? 'LOCAÇÃO' : 'VENDA'} · visita solicitada`,
+              this.cabecalhoCliente(conv),
+              `Busca: ${this.resumoBusca(conv.qualificacao)}`,
+              `Imóvel de interesse: ${ficha.codigo} · ${ficha.tipo} · ${ficha.bairro}${ficha.condominio ? ` (${ficha.condominio})` : ''} · ${ficha.preco_formatado}`,
+              ficha.url,
+              `Visita: ${rotuloData(args.data)} às ${args.hora}`,
+              visita.observacoes ? `Obs.: ${visita.observacoes}` : '',
+              `Confirme com o cliente pelo WhatsApp da Mafuz. Quando você escrever, a ${this.config.agente.nome} fica em silêncio por ${this.config.comportamento.pausaHumanoMin} min.`,
+            ]
+              .filter(Boolean)
+              .join('\n'),
+          carteiraVisita
         );
         if (!turno.simulacao) await this.enviarLeadImoview(conv, `Visita solicitada: ${rotuloData(args.data)} às ${args.hora}, imóvel ${ficha.codigo}`);
         this.store.evento('visita', { fone: conv.fone, id: visita.id, codigo: ficha.codigo, data: args.data, hora: args.hora });
@@ -432,23 +528,30 @@ class Agente {
       case 'transferir_humano': {
         const motivo = args.motivo || 'outro';
         const urgencia = args.urgencia || (['negociacao', 'alto_ticket', 'reclamacao', 'lgpd'].includes(motivo) ? 'alta' : 'normal');
-        const horas = this.config.comportamento.pausaHumanoHoras;
+        const minutosPausa = this.config.comportamento.pausaHumanoMin;
         const anterior = conv.encaminhamento;
         const repetido = anterior && anterior.motivo === motivo && Date.now() - anterior.ts < 60 * 60000;
         conv.encaminhamento = { motivo, urgencia, ts: repetido ? anterior.ts : Date.now() };
         conv.transferencias.push({ motivo, urgencia, resumo: args.resumo, ts: Date.now() });
         conv.turnosSemAvanco = 0;
         turno.transferiu = true;
-        if (!repetido) {
-          await this.alertar(turno, () =>
-            [
-              `${urgencia === 'alta' ? '🔴' : motivo === 'qualificado' ? '🟢' : '🟠'} ${motivo === 'qualificado' ? 'CLIENTE PRONTO PARA O CORRETOR' : 'CHAMAR CORRETOR'}: ${MOTIVO_LEGIVEL[motivo] || motivo}${urgencia === 'alta' ? ' (URGENTE)' : ''}`,
-              this.cabecalhoCliente(conv),
-              `Resumo: ${args.resumo || '-'}`,
-              `Busca: ${this.resumoBusca(conv.qualificacao)}`,
-              `Imóveis enviados: ${this.imoveisVistos(conv)}`,
-              `A ${this.config.agente.nome} segue atendendo até alguém da equipe responder este cliente pelo WhatsApp da Mafuz. Quando você responder, ela para por ${horas}h.`,
-            ].join('\n')
+        // Visita reservada já gerou o alerta completo; o "qualificado" logo depois não repete.
+        const jaAlertouVisita = motivo === 'qualificado' && turno.agendou;
+        if (!repetido && !jaAlertouVisita) {
+          const carteiraT = this.carteiraDe(conv);
+          const interesse = conv.qualificacao.codigo_imovel_interesse && conv.imoveis[conv.qualificacao.codigo_imovel_interesse];
+          await this.alertar(
+            turno,
+            () =>
+              [
+                `🔔 NOVO LEAD · ${carteiraT === 'locacao' ? 'LOCAÇÃO' : 'VENDA'} · ${MOTIVO_LEGIVEL[motivo] || motivo}${urgencia === 'alta' ? ' · URGENTE' : ''}`,
+                this.cabecalhoCliente(conv),
+                `Busca: ${this.resumoBusca(conv.qualificacao)}`,
+                interesse ? `Imóvel de interesse: ${interesse.codigo} · ${interesse.tipo} · ${interesse.bairro} · ${interesse.preco_formatado}\n${interesse.url}` : `Imóveis enviados: ${this.imoveisVistos(conv)}`,
+                `Resumo:\n${args.resumo || '-'}`,
+                `A ${this.config.agente.nome} segue atendendo até alguém responder este cliente pelo WhatsApp da Mafuz. Quando você responder, ela fica em silêncio por ${minutosPausa} min.`,
+              ].join('\n'),
+            carteiraT
           );
           if (motivo !== 'lgpd' && !turno.simulacao) await this.enviarLeadImoview(conv, `Encaminhado ao corretor: ${MOTIVO_LEGIVEL[motivo] || motivo}. ${args.resumo || ''}`);
         }
@@ -463,6 +566,29 @@ class Agente {
       default:
         return { erro: `Ferramenta desconhecida: ${nome}` };
     }
+  }
+
+  // Legenda do cartão de imóvel (vai junto com a foto). Sem travessões.
+  legendaImovel(i, motivo) {
+    const local = [i.bairro, i.cidade].filter(Boolean).join(', ');
+    const lote = /lote|terreno/i.test(i.tipo || '');
+    const medidas = [
+      !lote && i.dormitorios ? `${i.dormitorios} ${i.dormitorios === 1 ? 'quarto' : 'quartos'}` : '',
+      !lote && i.suites ? `${i.suites} ${i.suites === 1 ? 'suíte' : 'suítes'}` : '',
+      i.area_m2 ? `${Math.round(i.area_m2).toLocaleString('pt-BR')} m²` : i.area_lote_m2 ? `lote de ${Math.round(i.area_lote_m2).toLocaleString('pt-BR')} m²` : '',
+      !lote && i.vagas ? `${i.vagas} ${i.vagas === 1 ? 'vaga' : 'vagas'}` : '',
+    ].filter(Boolean);
+    const preco = i.preco_formatado && !/sob consulta/i.test(i.preco_formatado) ? i.preco_formatado : 'Valor sob consulta';
+    const limpo = (t) => String(t || '').replace(/\s*[—–]\s*/g, ', ').replace(/ +- +/g, ', ').trim();
+    return [
+      `*${limpo(i.tipo)}${local ? ` · ${limpo(local)}` : ''}*`,
+      medidas.join(' · '),
+      preco + (i.finalidade === 'locacao' && !/sob consulta/i.test(preco) ? ' por mês' : ''),
+      motivo ? `\n${limpo(motivo)}` : '',
+      `\n${i.url}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   // ---------------- barreiras de saída ----------------
@@ -513,22 +639,26 @@ class Agente {
   }
 
   // ---------------- turno completo ----------------
-  async responder(conv, textoCliente, sinais = {}) {
+  async responder(conv, textoCliente, sinais = {}, opcoes = {}) {
+    const canal = opcoes.canal || 'whatsapp';
     const totalCarteira = this.catalogo && this.catalogo.pronto() ? this.catalogo.itens.length : 0;
-    const sistema = montarSistema({ conv, config: this.config, sinais, totalCarteira });
-    const historico = conv.historico.slice(-24).map((h) => ({ role: h.papel === 'cliente' ? 'user' : 'assistant', content: h.texto }));
+    const sistema = montarSistema({ conv, config: this.config, sinais, totalCarteira, canal });
+    const historico = (opcoes.historico || conv.historico.slice(-24).map((h) => ({ role: h.papel === 'cliente' ? 'user' : 'assistant', content: h.texto }))).slice();
     while (historico.length && historico[0].role !== 'user') historico.shift();
     const mensagens = [...historico, { role: 'user', content: textoCliente }];
-    const turno = { buscou: false, registrou: false, agendou: false, transferiu: false, ferramentas: [], alertas: [], textoCliente, simulacao: !!sinais.simulacao };
+    const turno = { buscou: false, registrou: false, agendou: false, transferiu: false, ferramentas: [], alertas: [], cartoes: [], textoCliente, simulacao: !!sinais.simulacao };
+    const permitidas = opcoes.ferramentas || null;
+    const ferramentas = permitidas ? FERRAMENTAS.filter((f) => permitidas.includes(f.name)) : FERRAMENTAS;
 
     let final = '';
     for (let passo = 0; passo < 6; passo++) {
-      const r = await this.llm.conversar({ sistema, mensagens, ferramentas: FERRAMENTAS });
+      const r = await this.llm.conversar({ sistema, mensagens, ferramentas });
       if (r.toolCalls && r.toolCalls.length) {
         mensagens.push({ role: 'assistant', content: r.texto, toolCalls: r.toolCalls });
         for (const tc of r.toolCalls) {
           let saida;
           try {
+            if (permitidas && !permitidas.includes(tc.name)) throw new Error('ferramenta indisponível neste canal');
             saida = await this.executar(tc.name, tc.args, conv, turno);
           } catch (e) {
             log('ferramenta_erro', { ferramenta: tc.name, erro: e.message });
@@ -552,11 +682,35 @@ class Agente {
       }
     }
 
+    if (!final && turno.cartoes.length) final = 'Qual deles te chamou mais a atenção?';
+    if (!final && sinais.reengajamento) return { texto: '', turno };
     if (!final) final = 'Me dá só um instante, vou confirmar essa informação e já te retorno por aqui.';
     if ((turno.registrou || turno.agendou) && !conv.lgpdAvisado && !/pol[ií]tica de privacidade/i.test(final)) {
       final += '\n\nSeus dados são usados apenas para o seu atendimento, conforme nossa política de privacidade.';
     }
     return { texto: this.guardar(final, conv), turno };
+  }
+
+  // Mensagem proativa (cutucada de 15 min e follow-ups de 3 e 7 dias).
+  async reengajar(conv, tipo) {
+    const instrucao = `[Sistema: o cliente não respondeu. Escreva agora a mensagem de reengajamento "${tipo}" seguindo as regras de ATENÇÃO. Não mencione este aviso.]`;
+    const ferramentas = tipo === 'followup3' ? ['buscar_imoveis', 'enviar_imoveis', 'mercado_regiao'] : [];
+    return this.responder(conv, instrucao, { reengajamento: tipo }, { ferramentas });
+  }
+
+  // Chat do site (/site/chat): mesmo cérebro, sem ações de WhatsApp. Devolve texto com [ID:uuid]
+  // no lugar dos links de imóvel, que o site transforma em cartões com foto.
+  async responderSite(mensagensSite) {
+    const hist = (Array.isArray(mensagensSite) ? mensagensSite : [])
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-16)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
+    const ultima = hist.pop();
+    if (!ultima || ultima.role !== 'user') return { texto: 'Oi! Sou a Gabi, da Mafuz. Me conta o que você procura?' };
+    const conv = { fone: 'site', nome: '', historico: [], qualificacao: {}, imoveis: {}, urlsPermitidas: [], visitas: [], transferencias: [], lgpdAvisado: true };
+    const r = await this.responder(conv, ultima.content, {}, { canal: 'site', historico: hist, ferramentas: ['buscar_imoveis', 'detalhar_imovel', 'mercado_regiao'] });
+    const texto = r.texto.replace(/https?:\/\/[^\s]*\/imovel\/([0-9a-f-]{36})/gi, '[ID:$1]');
+    return { texto, ferramentas: r.turno.ferramentas };
   }
 }
 

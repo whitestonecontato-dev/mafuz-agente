@@ -59,6 +59,15 @@ class ZApi {
     return r;
   }
 
+  // Foto com legenda. `imagem` pode ser uma URL pública ou um data URI em base64.
+  async enviarImagem(fone, imagem, legenda, { delayTyping } = {}) {
+    const corpo = { phone: String(fone), image: imagem, caption: legenda || '' };
+    if (delayTyping) corpo.delayTyping = Math.max(1, Math.min(15, Math.round(delayTyping)));
+    const r = await this.chamar('POST', 'send-image', corpo);
+    log('zapi_imagem', { fone: mascarar(fone), chars: (legenda || '').length, messageId: r && r.messageId });
+    return r;
+  }
+
   async status() {
     return this.chamar('GET', 'status', null, 1);
   }

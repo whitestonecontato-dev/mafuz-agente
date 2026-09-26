@@ -11,7 +11,7 @@ const MAX_HISTORICO = 40;
 const MAX_EVENTOS = 2000;
 
 class Store {
-  constructor(dir, { conversaTtlDias = 7 } = {}) {
+  constructor(dir, { conversaTtlDias = 15 } = {}) {
     this.dir = dir;
     this.arquivo = path.join(dir, 'estado.json');
     this.ttlMs = conversaTtlDias * 86400000;
@@ -120,6 +120,10 @@ class Store {
       temperatura: null,
       lgpdAvisado: false,
       falhas: 0,
+      // reengajamento
+      optOut: false,
+      humanoAssumiuEm: 0,
+      reeng: { cutucadaDe: 0, followups: {} },
     };
   }
 
@@ -142,8 +146,12 @@ class Store {
   }
 
   pausar(fone, horas, motivo) {
+    this.pausarMin(fone, horas * 60, motivo);
+  }
+
+  pausarMin(fone, minutos, motivo) {
     const c = this.conversa(fone);
-    c.pausadoAte = Date.now() + horas * 3600000;
+    c.pausadoAte = Date.now() + minutos * 60000;
     c.motivoPausa = motivo;
     this.sujo = true;
   }

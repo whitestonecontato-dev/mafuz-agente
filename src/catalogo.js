@@ -182,6 +182,47 @@ class Catalogo {
     }
   }
 
+  // Retrato de preço de uma região a partir da própria carteira (anúncios ativos da MAFUZ).
+  // Não é índice de mercado: é o que a casa tem publicado hoje.
+  mercadoRegiao({ bairro, cidade, tipo, finalidade } = {}) {
+    const alvoB = norm(bairro || '');
+    const alvoC = norm(cidade || '');
+    const grupo = tipo ? Imoview.grupoTipo(tipo) : null;
+    const fin = finalidade === 'locacao' ? 'locacao' : 'venda';
+    const base = this.itens.filter(
+      (i) =>
+        i.finalidade === fin &&
+        (!alvoB || i.bairroNorm.includes(alvoB) || norm(i.condominio || '').includes(alvoB) || i.texto.slice(0, 200).includes(alvoB)) &&
+        (!alvoC || norm(i.cidade).includes(alvoC)) &&
+        (!grupo || i.grupo === grupo)
+    );
+    const mediana = (v) => {
+      if (!v.length) return null;
+      const o = [...v].sort((a, b) => a - b);
+      return o[Math.floor(o.length / 2)];
+    };
+    const precos = base.map((i) => i.preco).filter(Boolean);
+    const m2 = base.filter((i) => i.preco && i.area_m2 >= 20).map((i) => i.preco / i.area_m2);
+    const limite30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const novos = base.filter((i) => i.cadastro && i.cadastro >= limite30).length;
+    const reduzidos = base.filter((i) => i.precoAnterior && i.preco && i.precoAnterior > i.preco * 1.02).length;
+    const confiavel = m2.length >= 8;
+    return {
+      fonte: `Carteira ativa da Mafuz (anúncios publicados), atualizada em ${this.ultimaSync || 'hoje'}. Não é índice oficial de mercado.`,
+      recorte: [bairro, cidade, tipo, fin === 'locacao' ? 'locação' : 'venda'].filter(Boolean).join(' · '),
+      imoveis_na_carteira: base.length,
+      preco_mediano: precos.length ? formatarBRL(mediana(precos)) : null,
+      faixa_de_preco: precos.length ? `${formatarBRL(Math.min(...precos))} a ${formatarBRL(Math.max(...precos))}` : null,
+      valor_m2_mediano: confiavel ? formatarBRL(mediana(m2)) + (fin === 'locacao' ? ' por m² ao mês' : ' por m²') : null,
+      amostra_m2: m2.length,
+      novos_ultimos_30_dias: novos,
+      com_preco_reduzido: reduzidos,
+      como_usar: confiavel
+        ? 'Cite como referência da carteira da Mafuz ("entre os imóveis que temos hoje na região..."), nunca como valor oficial de mercado nem como avaliação de um imóvel específico.'
+        : 'Amostra pequena para falar em valor por m². Não cite média; diga que o corretor traz o estudo completo da região.',
+    };
+  }
+
   // Por que este imóvel é uma boa oportunidade (só com base nos dados).
   oportunidade(i) {
     const motivos = [];
@@ -276,6 +317,7 @@ class Catalogo {
     const destaques = [...new Set([...(extra.atende || []), ...i.flags.map((f) => DIFERENCIAIS[f]).filter(Boolean)])].slice(0, 6);
     return {
       codigo: i.codigo,
+      finalidade: i.finalidade,
       tipo: i.tipo,
       bairro: i.bairro,
       cidade: i.cidade,
@@ -345,7 +387,7 @@ class Catalogo {
     for (const k of ['preco_min', 'preco_max', 'dormitorios_min', 'suites_min', 'vagas_min', 'area_min', 'codigo', 'texto_livre', 'ordenar']) if (f[k]) aplicados[k] = f[k];
 
     const desejos = this.interpretarDesejos(f.texto_livre);
-    const limite = Math.min(Math.max(+f.limite || 5, 1), 5);
+    const limite = Math.min(Math.max(+f.limite || 6, 1), 6);
 
     const ranquear = (lista, extra = {}) => {
       const vistos = new Set();

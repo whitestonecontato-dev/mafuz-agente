@@ -54,13 +54,15 @@ const config = {
     baseUrl: env('IMOVIEW_BASE_URL', 'https://api.imoview.com.br').replace(/\/$/, ''),
     chave: env('IMOVIEW_API_KEY'),
     enviarLeads: bool(env('IMOVIEW_ENVIAR_LEADS', 'false')),
-    midiaLead: env('IMOVIEW_MIDIA_LEAD', 'WhatsApp - Mafuz IA'),
+    midiaLead: env('IMOVIEW_MIDIA_LEAD', 'WhatsApp - Gabi'),
     codigoUnidadeLead: env('IMOVIEW_CODIGO_UNIDADE'),
     emailCorretorLead: env('IMOVIEW_EMAIL_CORRETOR'),
   },
 
   site: {
-    url: env('SITE_URL', 'https://mafuz.com.br').replace(/\/$/, ''),
+    url: env('SITE_URL', 'https://mafuz.site').replace(/\/$/, ''),
+    // Origens autorizadas a usar a Gabi pelo chat do site (/site/chat).
+    origensChat: String(env('SITE_CHAT_ORIGINS', 'https://mafuz.site,https://www.mafuz.site,http://localhost:8080,null')).split(',').map((s) => s.trim()).filter(Boolean),
     // Chave pública ("anon", somente leitura) que o próprio site usa no navegador — não é segredo.
     supabaseUrl: env('SITE_SUPABASE_URL', 'https://gdkzyhvqyqucnbwtsryg.supabase.co').replace(/\/$/, ''),
     supabaseAnonKey: env(
@@ -94,8 +96,11 @@ const config = {
   },
 
   equipe: {
-    // Recebem os alertas (lead, visita, transferência). Formato 5531999999999, separados por vírgula.
+    // Gestão: recebem TODOS os alertas (lead novo, visita, corretor, falha). Formato 5531999999999, separados por vírgula.
     alertas: lista(env('TEAM_PHONES')),
+    // Corretores por carteira: recebem os pedidos de corretor e de visita da carteira deles.
+    venda: lista(env('TEAM_VENDA', '5531989097232,5531988093993')),
+    locacao: lista(env('TEAM_LOCACAO', '5531987176953,5531994099755,5531999549025')),
     // Podem mandar comandos (#status, #pausar, #retomar, #desligar, #ligar) para o número da MAFUZ.
     admins: lista(env('ADMIN_PHONES')),
     // Nome exibido ao cliente quando ele é transferido (ex.: "nossa equipe de corretores").
@@ -108,13 +113,31 @@ const config = {
     modo: env('MODO_OPERACAO', '24h'),
     horarioTexto: env('HORARIO_COMERCIAL', '1-5 09:00-18:00; 6 09:00-13:00'),
     horarioVisitasTexto: env('HORARIO_VISITAS', '1-5 09:00-18:00; 6 09:00-13:00'),
+    // Espera o cliente terminar de digitar: base + variação aleatória (padrão 4 a 7 s).
     debounceMs: +env('DEBOUNCE_MS', '4000'),
-    pausaHumanoHoras: +env('PAUSA_HUMANO_HORAS', '12'),
+    debounceVariacaoMs: +env('DEBOUNCE_VARIACAO_MS', '3000'),
+    // Quando um corretor responde pelo número da MAFUZ, a Gabi fica em silêncio e volta
+    // sozinha depois deste tempo sem nova mensagem do corretor.
+    pausaHumanoMin: +env('PAUSA_HUMANO_MIN', '60'),
+    // Máximo de mensagens de texto por resposta (os cartões de imóvel são à parte).
+    maxMensagens: +env('MAX_MENSAGENS', '2'),
+    enviarFotos: bool(env('ENVIAR_FOTOS', 'true')),
     maxTurnosSemAvanco: +env('MAX_TURNOS', '12'),
-    conversaTtlDias: +env('CONVERSA_TTL_DIAS', '7'),
+    conversaTtlDias: +env('CONVERSA_TTL_DIAS', '15'),
     transcreverAudio: bool(env('TRANSCREVER_AUDIO', 'true')),
     modeloTranscricao: env('MODELO_TRANSCRICAO', 'whisper-1'),
     limiteAltoTicket: +env('LIMITE_ALTO_TICKET', '10000000'),
+  },
+
+  // Reengajamento: cutucada após N minutos sem resposta e follow-ups em dias.
+  reengajamento: {
+    ativo: bool(env('REENGAJAMENTO', 'true')),
+    cutucadaMin: +env('CUTUCADA_MIN', '15'),
+    followupDias: String(env('FOLLOWUP_DIAS', '3,7')).split(',').map(Number).filter((n) => n > 0),
+    // Janela de envio: nada sai fora dela (fica para o próximo horário válido). Padrão: seg a sáb, 8h às 21h.
+    janela: env('JANELA_ENVIO', '1-6 08:00-21:00'),
+    // Só para testes: multiplica os tempos (ex.: 0.001 simula dias em segundos).
+    escala: +env('REENGAJAMENTO_ESCALA', '1'),
   },
 
   dataDir: env('DATA_DIR', path.join(__dirname, '..', 'data')),
@@ -123,6 +146,7 @@ const config = {
 
 config.comportamento.horario = parseHorario(config.comportamento.horarioTexto);
 config.comportamento.horarioVisitas = parseHorario(config.comportamento.horarioVisitasTexto);
+config.reengajamento.janelaRegras = parseHorario(config.reengajamento.janela);
 
 function validar() {
   const faltando = [];

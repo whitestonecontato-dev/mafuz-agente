@@ -44,6 +44,33 @@ class SiteLinks {
     return `${this.cfg.url}/imoveis?q=${encodeURIComponent(codigo)}`;
   }
 
+  // Foto de capa do imóvel no site (a mesma que aparece na ficha).
+  async capa(codigo, url) {
+    const chave = `capa:${codigo}`;
+    const hit = this.cache.get(chave);
+    if (hit && Date.now() - hit.ts < TTL_MS) return hit.url;
+    if (!this.cfg.supabaseUrl || !this.cfg.supabaseAnonKey) return null;
+    const h = { apikey: this.cfg.supabaseAnonKey, Authorization: `Bearer ${this.cfg.supabaseAnonKey}` };
+    try {
+      let id = (String(url || '').match(/\/imovel\/([0-9a-f-]{36})/i) || [])[1];
+      if (!id) {
+        const r = await fetch(`${this.cfg.supabaseUrl}/rest/v1/properties?select=id&status=eq.published&external_id=eq.${encodeURIComponent(codigo)}&limit=1`, { headers: h, signal: AbortSignal.timeout(8000) });
+        id = r.ok ? ((await r.json())[0] || {}).id : null;
+      }
+      if (!id) return null;
+      const r = await fetch(
+        `${this.cfg.supabaseUrl}/rest/v1/property_images?select=file_url&property_id=eq.${id}&order=is_cover.desc,sort_order.asc&limit=1`,
+        { headers: h, signal: AbortSignal.timeout(8000) }
+      );
+      const foto = r.ok ? ((await r.json())[0] || {}).file_url : null;
+      if (foto) this.cache.set(chave, { url: foto, ts: Date.now() });
+      return foto || null;
+    } catch (e) {
+      log('site_capa_erro', { codigo, erro: e.message });
+      return null;
+    }
+  }
+
   // Retorna Map codigo -> { url, pagina } (pagina=false quando o imóvel ainda não tem ficha no site).
   async resolver(codigos) {
     const saida = new Map();

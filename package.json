@@ -1,6 +1,6 @@
 {
   "name": "mafuz-agente-whatsapp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Mafuz IA — agente de atendimento no WhatsApp (Z-API + Imoview + LLM), sem n8n",
   "main": "src/server.js",
   "private": true,
